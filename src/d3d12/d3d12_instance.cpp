@@ -26,13 +26,13 @@ namespace conduit::d3d12 {
                 if (!lib.d3d12 || !lib.dxgi)
                     return false;
                 lib.create_device =
-                    reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(GetProcAddress(lib.d3d12, "D3D12CreateDevice"));
-                lib.get_debug_interface = reinterpret_cast<PFN_D3D12_GET_DEBUG_INTERFACE>(
-                    GetProcAddress(lib.d3d12, "D3D12GetDebugInterface"));
-                lib.serialize_root_signature = reinterpret_cast<PFN_D3D12_SERIALIZE_VERSIONED_ROOT_SIGNATURE>(
+                    function_cast<PFN_D3D12_CREATE_DEVICE>(GetProcAddress(lib.d3d12, "D3D12CreateDevice"));
+                lib.get_debug_interface =
+                    function_cast<PFN_D3D12_GET_DEBUG_INTERFACE>(GetProcAddress(lib.d3d12, "D3D12GetDebugInterface"));
+                lib.serialize_root_signature = function_cast<PFN_D3D12_SERIALIZE_VERSIONED_ROOT_SIGNATURE>(
                     GetProcAddress(lib.d3d12, "D3D12SerializeVersionedRootSignature"));
                 lib.create_factory2 =
-                    reinterpret_cast<decltype(lib.create_factory2)>(GetProcAddress(lib.dxgi, "CreateDXGIFactory2"));
+                    function_cast<decltype(lib.create_factory2)>(GetProcAddress(lib.dxgi, "CreateDXGIFactory2"));
                 if (options_.hooks.dxgi_create_factory)
                     lib.create_factory2 =
                         reinterpret_cast<decltype(lib.create_factory2)>(options_.hooks.dxgi_create_factory);

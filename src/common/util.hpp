@@ -4,6 +4,10 @@
 #include <algorithm>
 
 namespace conduit {
+    template <class To, class From> To function_cast(From from) {
+        return reinterpret_cast<To>(reinterpret_cast<void (*)()>(from));
+    }
+
     constexpr uint64_t align_up(uint64_t value, uint64_t alignment) {
         return (value + alignment - 1) / alignment * alignment;
     }

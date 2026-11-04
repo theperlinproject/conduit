@@ -19,6 +19,8 @@
 #define CONDUIT_CAN_VERIFY_SIGNATURES 0
 #endif
 
+#include "common/util.hpp"
+
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -42,7 +44,7 @@ namespace conduit::vendor {
             PFun_slGetFeatureFunction* get_feature_function = nullptr;
 
             template <class F> bool bind(F*& slot, const char* name) {
-                slot = reinterpret_cast<F*>(GetProcAddress(module, name));
+                slot = function_cast<F*>(GetProcAddress(module, name));
                 return slot != nullptr;
             }
 

@@ -158,14 +158,14 @@ namespace conduit::d3d11 {
                 if (!lib.d3d11 || !lib.dxgi)
                     return false;
                 lib.create_device =
-                    reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(GetProcAddress(lib.d3d11, "D3D11CreateDevice"));
+                    function_cast<PFN_D3D11_CREATE_DEVICE>(GetProcAddress(lib.d3d11, "D3D11CreateDevice"));
                 lib.create_factory1 =
-                    reinterpret_cast<decltype(lib.create_factory1)>(GetProcAddress(lib.dxgi, "CreateDXGIFactory1"));
+                    function_cast<decltype(lib.create_factory1)>(GetProcAddress(lib.dxgi, "CreateDXGIFactory1"));
                 if (!lib.create_device || !lib.create_factory1)
                     return false;
                 lib.compiler = LoadLibraryW(L"d3dcompiler_47.dll");
                 if (lib.compiler)
-                    lib.compile = reinterpret_cast<compile_fn>(GetProcAddress(lib.compiler, "D3DCompile"));
+                    lib.compile = function_cast<compile_fn>(GetProcAddress(lib.compiler, "D3DCompile"));
                 state_->validation = options_.validation;
                 if (FAILED(lib.create_factory1(winrt::guid_of<IDXGIFactory2>(), state_->factory.put_void())))
                     return false;
