@@ -133,6 +133,9 @@ if(MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
 endif()
 if(_conduit_msvc_like)
     set(_conduit_warnings /W4 /permissive- /Zc:__cplusplus /utf-8)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        list(APPEND _conduit_warnings -Wno-missing-field-initializers)
+    endif()
     if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
         list(APPEND _conduit_warnings /Zc:preprocessor /Zc:inline /bigobj /MP
             /wd4244 /wd4267 /wd4245 /wd4305 /wd4310 /wd4389

@@ -2,6 +2,7 @@
 #include "common/util.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -55,6 +56,10 @@ static shader_handle make_shader(device& dev, const char* file, shader_stage sta
     path.resize(path.size() - 3);
     path += g_api == api::d3d12 ? "dxil" : "spv";
     auto code = load_file(path);
+    if (code.empty()) {
+        std::fprintf(stderr, "missing shader %s: skipped\n", path.c_str());
+        std::exit(77);
+    }
     shader_desc sd;
     sd.format = g_api == api::d3d12 ? shader_format::dxil : shader_format::spirv;
     sd.stage = stage;
