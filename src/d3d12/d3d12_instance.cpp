@@ -7,6 +7,26 @@
 
 namespace conduit::d3d12 {
     namespace {
+        D3D12_COMMAND_LIST_TYPE queue_type_of(ID3D12CommandQueue* queue) {
+#ifdef __MINGW32__
+            D3D12_COMMAND_QUEUE_DESC d{};
+            queue->GetDesc(&d);
+            return d.Type;
+#else
+            return queue->GetDesc().Type;
+#endif
+        }
+
+        uint64_t luid_of(ID3D12Device* device) {
+#ifdef __MINGW32__
+            LUID id{};
+            device->GetAdapterLuid(&id);
+#else
+            const LUID id = device->GetAdapterLuid();
+#endif
+            return (static_cast<uint64_t>(id.HighPart) << 32) | id.LowPart;
+        }
+
         std::string narrow(const wchar_t* w) {
             std::string out;
             for (; *w; w++)
@@ -66,6 +86,28 @@ namespace conduit::d3d12 {
 
             api get_api() const override { return api::d3d12; }
             const std::vector<adapter_info>& adapters() const override { return adapters_; }
+
+            std::unique_ptr<conduit::device> adopt_device(const adopt_desc& desc,
+                                                          const conduit::device_options& device_options) override {
+                auto* native = static_cast<ID3D12Device*>(desc.device);
+                auto* queue = static_cast<ID3D12CommandQueue*>(desc.queue);
+                if (!native || !queue || queue_type_of(queue) != D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    return nullptr;
+                const uint64_t luid = luid_of(native);
+                for (size_t i = 0; i < adapters_.size(); i++) {
+                    if (adapters_[i].luid != luid)
+                        continue;
+                    auto device = std::make_unique<d3d12::device>(state_, native_[i], adapters_[i], device_options);
+                    device->adopt(native, queue);
+                    std::string error;
+                    if (!device->init(error)) {
+                        std::fprintf(stderr, "[d3d12] adopting the device failed: %s\n", error.c_str());
+                        return nullptr;
+                    }
+                    return device;
+                }
+                return nullptr;
+            }
 
             std::unique_ptr<conduit::device> create_device(const conduit::device_options& device_options) override {
                 if (device_options.adapter_index >= adapters_.size() || !adapters_[device_options.adapter_index].usable)
@@ -182,10 +224,18 @@ namespace conduit::d3d12 {
         retire_.flush_all();
     }
 
+    void device::adopt(ID3D12Device* device, ID3D12CommandQueue* queue) {
+        device_.copy_from(device);
+        queues_[0].queue.copy_from(queue);
+    }
+
+    texture_handle device::import_texture(void* native, const texture_desc& desc) {
+        return native ? wrap_swapchain_image(static_cast<ID3D12Resource*>(native), desc) : texture_handle{};
+    }
+
     bool device::init(std::string& error) {
-        const HRESULT hr = inst_->lib.create_device(adapter_.get(), D3D_FEATURE_LEVEL_12_0,
-                                                    winrt::guid_of<ID3D12Device>(), device_.put_void());
-        if (FAILED(hr)) {
+        if (!device_ && FAILED(inst_->lib.create_device(adapter_.get(), D3D_FEATURE_LEVEL_12_0,
+                                                        winrt::guid_of<ID3D12Device>(), device_.put_void()))) {
             error = "D3D12CreateDevice failed";
             return false;
         }
@@ -215,8 +265,8 @@ namespace conduit::d3d12 {
             D3D12_COMMAND_QUEUE_DESC qd{};
             qd.Type = types[i];
             qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-            if (FAILED(device_->CreateCommandQueue(&qd, winrt::guid_of<ID3D12CommandQueue>(),
-                                                   queues_[i].queue.put_void()))) {
+            if (!queues_[i].queue && FAILED(device_->CreateCommandQueue(&qd, winrt::guid_of<ID3D12CommandQueue>(),
+                                                                        queues_[i].queue.put_void()))) {
                 error = "CreateCommandQueue failed";
                 return false;
             }

@@ -182,6 +182,32 @@ namespace conduit::d3d11 {
             api get_api() const override { return api::d3d11; }
             const std::vector<adapter_info>& adapters() const override { return adapters_; }
 
+            std::unique_ptr<conduit::device> adopt_device(const adopt_desc& desc,
+                                                          const conduit::device_options& device_options) override {
+                auto* native = static_cast<ID3D11Device*>(desc.device);
+                if (!native)
+                    return nullptr;
+                winrt::com_ptr<IDXGIDevice> dxgi;
+                winrt::com_ptr<IDXGIAdapter> adapter;
+                if (FAILED(native->QueryInterface(winrt::guid_of<IDXGIDevice>(), dxgi.put_void())) ||
+                    FAILED(dxgi->GetAdapter(adapter.put())))
+                    return nullptr;
+                DXGI_ADAPTER_DESC d{};
+                adapter->GetDesc(&d);
+                const uint64_t luid = (static_cast<uint64_t>(d.AdapterLuid.HighPart) << 32) | d.AdapterLuid.LowPart;
+                for (size_t i = 0; i < adapters_.size(); i++) {
+                    if (adapters_[i].luid != luid)
+                        continue;
+                    auto device = std::make_unique<d3d11::device>(state_, native_[i], adapters_[i], device_options);
+                    device->adopt(native);
+                    std::string error;
+                    if (!device->init(error))
+                        return nullptr;
+                    return device;
+                }
+                return nullptr;
+            }
+
             std::unique_ptr<conduit::device> create_device(const conduit::device_options& device_options) override {
                 if (device_options.adapter_index >= adapters_.size() || !adapters_[device_options.adapter_index].usable)
                     return nullptr;

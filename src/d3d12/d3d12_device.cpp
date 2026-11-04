@@ -920,7 +920,8 @@ namespace conduit::d3d12 {
         texture_rec rec;
         if (!textures_.free(h, &rec))
             return;
-        live_textures_--;
+        if (!rec.external)
+            live_textures_--;
         if (use_validator_)
             validator_.on_destroy(h);
         retire([this, rec = std::move(rec)]() mutable {

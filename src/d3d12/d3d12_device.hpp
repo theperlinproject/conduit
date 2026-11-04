@@ -329,6 +329,8 @@ namespace conduit::d3d12 {
                const device_options& options);
         ~device() override;
         bool init(std::string& error);
+        void adopt(ID3D12Device* device, ID3D12CommandQueue* queue);
+        texture_handle import_texture(void* native, const texture_desc& desc) override;
 
         api get_api() const override { return api::d3d12; }
         const device_caps& caps() const override { return caps_; }

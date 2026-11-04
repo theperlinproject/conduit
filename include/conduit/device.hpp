@@ -241,6 +241,14 @@ namespace conduit {
             return {};
         }
 
+        // wraps a native texture (ID3D12Resource*, ID3D11Texture2D*) without taking ownership; on d3d12 it is
+        // tracked as starting in the common/present state
+        virtual texture_handle import_texture(void* native, const texture_desc& desc) {
+            (void)native;
+            (void)desc;
+            return {};
+        }
+
         virtual buffer_handle create_buffer(const buffer_desc& desc) = 0;
         virtual texture_handle create_texture(const texture_desc& desc) = 0;
         virtual sampler_handle create_sampler(const sampler_desc& desc) = 0;
@@ -301,12 +309,24 @@ namespace conduit {
         virtual float timestamp_period_ns() const = 0;
     };
 
+    struct adopt_desc {
+        void* device = nullptr;
+        void* queue = nullptr;
+    };
+
     class instance {
     public:
         virtual ~instance() = default;
         virtual api get_api() const = 0;
         virtual const std::vector<adapter_info>& adapters() const = 0;
         virtual std::unique_ptr<device> create_device(const device_options& options) = 0;
+        // wraps a device the host already created: d3d12 takes ID3D12Device + its direct ID3D12CommandQueue,
+        // d3d11 takes ID3D11Device (queue unused). the host keeps ownership; null when the api cannot adopt
+        virtual std::unique_ptr<device> adopt_device(const adopt_desc& desc, const device_options& options) {
+            (void)desc;
+            (void)options;
+            return nullptr;
+        }
     };
 
     // null when the api is not compiled in or has no driver on this machine

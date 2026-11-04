@@ -36,7 +36,8 @@ namespace conduit::d3d11 {
         lists_.clear();
         free_queries_.clear();
         if (immediate_) {
-            immediate_->ClearState();
+            if (!adopted_)
+                immediate_->ClearState();
             immediate_->Flush();
         }
     }
@@ -55,7 +56,19 @@ namespace conduit::d3d11 {
         return n;
     }
 
+    void device::adopt(ID3D11Device* device) {
+        device_.copy_from(device);
+        device->GetImmediateContext(immediate_.put());
+        adopted_ = true;
+    }
+
+    texture_handle device::import_texture(void* native, const texture_desc& desc) {
+        return native ? wrap_backbuffer(static_cast<ID3D11Texture2D*>(native), desc) : texture_handle{};
+    }
+
     bool device::init(std::string& error) {
+        if (adopted_)
+            return finish_init();
         UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
         if (inst_->validation)
             flags |= D3D11_CREATE_DEVICE_DEBUG;
@@ -84,6 +97,10 @@ namespace conduit::d3d11 {
             error = "D3D11CreateDevice failed";
             return false;
         }
+        return finish_init();
+    }
+
+    bool device::finish_init() {
         device1_ = device_.try_as<ID3D11Device1>();
         if (device1_) {
             D3D11_FEATURE_DATA_D3D11_OPTIONS options11{};
@@ -1037,7 +1054,7 @@ namespace conduit::d3d11 {
         {
             auto lock = lock_context();
             for (auto& cl : commands)
-                immediate_->ExecuteCommandList(cl.get(), FALSE);
+                immediate_->ExecuteCommandList(cl.get(), adopted_ ? TRUE : FALSE);
             for (const fence_op& op : desc.signals)
                 mark_submitted(op.fence, op.value);
         }

@@ -270,6 +270,9 @@ namespace conduit::d3d11 {
         ~device() override;
 
         bool init(std::string& error);
+        void adopt(ID3D11Device* device);
+        bool finish_init();
+        texture_handle import_texture(void* native, const texture_desc& desc) override;
 
         api get_api() const override { return api::d3d11; }
         const device_caps& caps() const override { return caps_; }
@@ -371,6 +374,7 @@ namespace conduit::d3d11 {
         winrt::com_ptr<ID3D11Device> device_;
         winrt::com_ptr<ID3D11Device1> device1_;
         winrt::com_ptr<ID3D11DeviceContext> immediate_;
+        bool adopted_ = false;
         device_options options_;
         device_caps caps_;
         device_stats stats_;
