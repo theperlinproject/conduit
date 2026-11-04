@@ -93,7 +93,7 @@ namespace conduit {
             return true;
 #endif
 #if CONDUIT_HAS_METAL
-        case Api::Metal:
+        case conduit::api::metal:
             return true;
 #endif
 #if CONDUIT_HAS_WEBGPU
@@ -133,8 +133,8 @@ namespace conduit {
             return backends::create_d3d11_instance(options);
 #endif
 #if CONDUIT_HAS_METAL
-        case Api::Metal:
-            return backends::CreateMetalInstance(options);
+        case conduit::api::metal:
+            return backends::create_metal_instance(options);
 #endif
 #if CONDUIT_HAS_WEBGPU
         case conduit::api::webgpu:

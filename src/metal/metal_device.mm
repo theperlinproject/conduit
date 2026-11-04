@@ -465,7 +465,7 @@ namespace conduit::metal {
 
     // slang numbers samplers 2*slot+1, past metal's 16 sampler slots: they are compacted in declaration order
     std::string device::prepare_stage(const shader& sh, const pipeline_layout_desc& layout,
-                                      std::vector<stage_slot>& slots, std::string& error) {
+                                      std::vector<stage_slot>& slots, std::string&) {
         std::vector<const shader_resource*> resources;
         for (const shader_resource& r : sh.iface.resources)
             resources.push_back(&r);

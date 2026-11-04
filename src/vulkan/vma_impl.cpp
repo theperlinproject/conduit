@@ -3,6 +3,8 @@
 #define VMA_IMPLEMENTATION
 #if defined(__clang__)
 #pragma clang diagnostic ignored "-Weverything"
+#elif defined(_MSC_VER)
+#pragma warning(push, 0)
 #elif defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wall"
 #pragma GCC diagnostic ignored "-Wextra"

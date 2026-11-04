@@ -4,40 +4,46 @@ on:
   push:
   pull_request:
 
+env:
+  SLANG_VERSION: "2026.20"
+
 jobs:
   build:
-    name: ${{ matrix.preset }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-24.04, preset: linux-clang }
-          - { os: ubuntu-24.04, preset: linux-gcc }
-          - { os: windows-2022, preset: windows-clang-cl }
-          - { os: macos-15, preset: macos }
+          - { name: linux-clang x64, os: ubuntu-24.04, preset: linux-clang, slang: linux-x86_64, test: true }
+          - { name: linux-gcc x64, os: ubuntu-24.04, preset: linux-gcc, slang: linux-x86_64, test: true }
+          - { name: windows-msvc x64, os: windows-2022, preset: windows-msvc, arch: amd64, slang: windows-x86_64, test: true }
+          - { name: windows-clang-cl x64, os: windows-2022, preset: windows-clang-cl, arch: amd64, slang: windows-x86_64, test: true }
+          - { name: macos arm64, os: macos-15, preset: macos, slang: macos-aarch64, test: true }
+          - { name: macos x64, os: macos-15-intel, preset: macos-x64, slang: macos-x86_64, test: true }
     steps:
       - uses: actions/checkout@v4
       - name: Install packages
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build mesa-vulkan-drivers
+        run: sudo apt-get update && sudo apt-get install -y ninja-build lld mesa-vulkan-drivers
       - name: Install packages
         if: runner.os == 'macOS'
         run: brew install ninja
       - name: Developer prompt
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
       - name: Fetch slang
+        if: matrix.slang
         shell: bash
         run: |
-          version=2026.20
-          case "${{ runner.os }}" in
-            Linux) archive=slang-$version-linux-x86_64.tar.gz ;;
-            macOS) archive=slang-$version-macos-aarch64.zip ;;
-            Windows) archive=slang-$version-windows-x86_64.zip ;;
+          case "${{ matrix.slang }}" in
+            linux-*) archive=slang-$SLANG_VERSION-${{ matrix.slang }}.tar.gz ;;
+            *) archive=slang-$SLANG_VERSION-${{ matrix.slang }}.zip ;;
           esac
           mkdir -p deps/slang
-          curl -fsSL -o "deps/$archive" "https://github.com/shader-slang/slang/releases/download/v$version/$archive"
+          curl -fsSL -o "deps/$archive" "https://github.com/shader-slang/slang/releases/download/v$SLANG_VERSION/$archive"
           case "$archive" in
             *.tar.gz) tar -xzf "deps/$archive" -C deps/slang ;;
             *) unzip -q "deps/$archive" -d deps/slang ;;
@@ -47,6 +53,7 @@ jobs:
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test
+        if: matrix.test
         run: ctest --preset ${{ matrix.preset }}
 
   lint:
@@ -54,10 +61,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install packages
-        run: sudo apt-get update && sudo apt-get install -y ninja-build clang-18 clang-tidy-18 clang-format-18
+        run: sudo apt-get update && sudo apt-get install -y ninja-build lld clang-18 clang-tidy-18 clang-format-18
       - name: Format
-        run: git ls-files '*.cpp' '*.hpp' '*.mm' | xargs clang-format-18 --dry-run --Werror
+        run: git ls-files '*.cpp' '*.hpp' '*.mm' | grep -v '/compat/' | xargs clang-format-18 --dry-run --Werror
       - name: Configure
         run: cmake --preset linux-clang
       - name: Tidy
-        run: run-clang-tidy-18 -quiet -p build/linux-clang "$PWD/(src|tests)/.*\\.cpp$"
+        run: run-clang-tidy-18 -quiet -p build/linux-clang "$PWD/(src|tests)/.*\.cpp$"

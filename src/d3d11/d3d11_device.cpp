@@ -89,7 +89,7 @@ namespace conduit::d3d11 {
             D3D11_FEATURE_DATA_D3D11_OPTIONS options11{};
             if (SUCCEEDED(device_->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options11, sizeof(options11))))
                 constant_offsetting_ =
-                    options11.ConstantBufferOffsetting != FALSE && std::getenv("PERLIN_D3D11_CB_OFFSET") != nullptr;
+                    options11.ConstantBufferOffsetting != FALSE && std::getenv("CONDUIT_D3D11_CB_OFFSET") != nullptr;
         }
         fill_caps();
         frame_fence_ = create_fence(0);

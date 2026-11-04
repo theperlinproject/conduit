@@ -249,20 +249,20 @@ namespace conduit::webgpu {
             if (!w.window)
                 return {};
             WGPUSurfaceDescriptor sd{};
-            sd.label = view("perlin surface");
+            sd.label = view("conduit surface");
 #if defined(__EMSCRIPTEN__)
             WGPUEmscriptenSurfaceSourceCanvasHTMLSelector src{};
             src.chain.sType = WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector;
-            src.selector = View(static_cast<const char*>(w.window));
+            src.selector = view(static_cast<const char*>(w.window));
             sd.nextInChain = &src.chain;
-            return Owned<WGPUSurface>(wgpuInstanceCreateSurface(instance, &sd));
+            return owned<WGPUSurface>(wgpuInstanceCreateSurface(instance, &sd));
 #elif defined(_WIN32)
             WGPUSurfaceSourceWindowsHWND src{};
             src.chain.sType = WGPUSType_SurfaceSourceWindowsHWND;
             src.hinstance = GetModuleHandleW(nullptr);
             src.hwnd = w.window;
             sd.nextInChain = &src.chain;
-            return Owned<WGPUSurface>(wgpuInstanceCreateSurface(instance, &sd));
+            return owned<WGPUSurface>(wgpuInstanceCreateSurface(instance, &sd));
 #elif defined(__ANDROID__)
             WGPUSurfaceSourceAndroidNativeWindow src{};
             src.chain.sType = WGPUSType_SurfaceSourceAndroidNativeWindow;
@@ -299,13 +299,13 @@ namespace conduit::webgpu {
 
             bool init() {
 #if defined(__EMSCRIPTEN__)
-                instance = Owned<WGPUInstance>(wgpuCreateInstance(nullptr));
-                if (!instance)
+                instance_ = owned<WGPUInstance>(wgpuCreateInstance(nullptr));
+                if (!instance_)
                     return false;
-                AdapterInfo info;
-                info.api = Api::WebGPU;
+                adapter_info info;
+                info.api = api::webgpu;
                 info.name = "Browser WebGPU";
-                infos.push_back(info);
+                infos_.push_back(info);
                 return true;
 #else
                 WGPUInstanceExtras extras{};
@@ -356,9 +356,10 @@ namespace conduit::webgpu {
                 WGPUDevice raw = emscripten_webgpu_get_device();
                 if (!raw)
                     return nullptr;
-                wgpuInstanceAddRef(instance.Get());
-                auto device = std::make_unique<WebGpuDevice>(Owned<WGPUInstance>(instance.Get()), Owned<WGPUAdapter>(),
-                                                             Owned<WGPUDevice>(raw), opts, infos[0], false);
+                wgpuInstanceAddRef(instance_.get());
+                auto device =
+                    std::make_unique<webgpu_device>(owned<WGPUInstance>(instance_.get()), owned<WGPUAdapter>(),
+                                                    owned<WGPUDevice>(raw), opts, infos_[0], false);
 #else
                 WGPUAdapter adapter = adapters_[opts.adapter_index].get();
                 std::vector<WGPUFeatureName> features;
@@ -369,7 +370,7 @@ namespace conduit::webgpu {
                 wgpuAdapterGetLimits(adapter, &limits);
 
                 WGPUDeviceDescriptor dd{};
-                dd.label = view("perlin device");
+                dd.label = view("conduit device");
                 dd.requiredFeatureCount = features.size();
                 dd.requiredFeatures = features.data();
                 dd.requiredLimits = &limits;

@@ -136,7 +136,7 @@ namespace conduit::vk {
 
                 VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
                 app.pApplicationName = options_.app_name;
-                app.pEngineName = "Perlin RHI";
+                app.pEngineName = "conduit";
                 app.apiVersion = state_->api_version;
 
                 VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};

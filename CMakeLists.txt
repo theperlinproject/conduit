@@ -12,6 +12,7 @@ else()
     set(CONDUIT_TOP_LEVEL OFF)
 endif()
 
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(GNUInstallDirs)
 
@@ -106,7 +107,6 @@ endif()
 set(_conduit_with_streamline OFF)
 if(CONDUIT_STREAMLINE AND WIN32)
     set(_conduit_with_streamline ON)
-    list(APPEND CONDUIT_SOURCES src/vendor/streamline.cpp)
 endif()
 
 add_library(conduit STATIC ${CONDUIT_SOURCES})
@@ -127,16 +127,33 @@ target_include_directories(conduit
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
+set(_conduit_msvc_like OFF)
 if(MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-    target_compile_options(conduit PRIVATE /W4 /permissive- /Zc:__cplusplus)
+    set(_conduit_msvc_like ON)
+endif()
+if(_conduit_msvc_like)
+    set(_conduit_warnings /W4 /permissive- /Zc:__cplusplus /utf-8)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+        list(APPEND _conduit_warnings /Zc:preprocessor /Zc:inline /bigobj /MP
+            /wd4244 /wd4267 /wd4245 /wd4305 /wd4310 /wd4389
+            /wd4456 /wd4457 /wd4458 /wd4459
+            /wd4127 /wd4201 /wd4324 /wd4701 /wd4703 /wd4702 /wd4706 /wd5054)
+    endif()
     if(CONDUIT_WARNINGS_AS_ERRORS)
-        target_compile_options(conduit PRIVATE /WX)
+        list(APPEND _conduit_warnings /WX)
     endif()
 else()
-    target_compile_options(conduit PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
+    set(_conduit_warnings -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
     if(CONDUIT_WARNINGS_AS_ERRORS)
-        target_compile_options(conduit PRIVATE -Werror)
+        list(APPEND _conduit_warnings -Werror)
     endif()
+endif()
+target_compile_options(conduit PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${_conduit_warnings}>")
+
+if(CONDUIT_LTO AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang"
+   AND NOT CMAKE_LINKER MATCHES "lld-link")
+    message(STATUS "conduit: link-time optimization with clang-cl needs CMAKE_LINKER=lld-link, building without it")
+    set(CONDUIT_LTO OFF)
 endif()
 
 if(CONDUIT_LTO)
@@ -144,6 +161,9 @@ if(CONDUIT_LTO)
     check_ipo_supported(RESULT _conduit_ipo OUTPUT _conduit_ipo_error LANGUAGES CXX)
     if(_conduit_ipo)
         set_target_properties(conduit PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT APPLE AND NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+            target_link_options(conduit INTERFACE -fuse-ld=lld)
+        endif()
     else()
         message(WARNING "conduit: link-time optimization unavailable: ${_conduit_ipo_error}")
     endif()
@@ -160,7 +180,7 @@ if(NOT EMSCRIPTEN)
 endif()
 
 if(WIN32)
-    target_compile_definitions(conduit PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_definitions(conduit PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 foreach(api VULKAN D3D12 D3D11 METAL WEBGPU)
@@ -185,19 +205,38 @@ if(CONDUIT_D3D12)
 endif()
 
 if(_conduit_with_streamline)
-    target_compile_definitions(conduit PUBLIC CONDUIT_HAS_STREAMLINE=1)
-    target_include_directories(conduit SYSTEM PRIVATE "${streamline_SOURCE_DIR}/include")
+    add_library(conduit_streamline OBJECT src/vendor/streamline.cpp)
+    set_target_properties(conduit_streamline PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+        CXX_SCAN_FOR_MODULES OFF
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(conduit_streamline PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_include_directories(conduit_streamline SYSTEM PRIVATE "${streamline_SOURCE_DIR}/include")
     if(MINGW)
-        target_include_directories(conduit SYSTEM PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/compat")
-    endif()
-    if(MSVC OR CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-        set_source_files_properties(src/vendor/streamline.cpp PROPERTIES COMPILE_OPTIONS "-clang:-std=c++20")
-    else()
-        set_source_files_properties(src/vendor/streamline.cpp PROPERTIES COMPILE_OPTIONS "-std=c++20")
+        target_include_directories(conduit_streamline SYSTEM PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/compat")
     endif()
     if(CONDUIT_VULKAN)
-        target_include_directories(conduit SYSTEM PRIVATE "${vulkan_headers_SOURCE_DIR}/include")
+        target_include_directories(conduit_streamline SYSTEM PRIVATE "${vulkan_headers_SOURCE_DIR}/include")
     endif()
+    target_compile_definitions(conduit_streamline PRIVATE
+        CONDUIT_HAS_STREAMLINE=1 NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
+        $<$<BOOL:${CONDUIT_VULKAN}>:CONDUIT_HAS_VULKAN=1 VK_NO_PROTOTYPES>
+        $<$<BOOL:${CONDUIT_D3D12}>:CONDUIT_HAS_D3D12=1>
+        $<$<BOOL:${CONDUIT_D3D11}>:CONDUIT_HAS_D3D11=1>)
+    target_compile_options(conduit_streamline PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${_conduit_warnings}>")
+    if(CONDUIT_LTO AND _conduit_ipo)
+        set_target_properties(conduit_streamline PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
+    endif()
+    if(CONDUIT_CLANG_TIDY)
+        set_target_properties(conduit_streamline PROPERTIES CXX_CLANG_TIDY "${CONDUIT_CLANG_TIDY_EXE}")
+    endif()
+    target_sources(conduit PRIVATE $<TARGET_OBJECTS:conduit_streamline>)
+    target_compile_definitions(conduit PUBLIC CONDUIT_HAS_STREAMLINE=1)
 endif()
 
 if(CONDUIT_WEBGPU)

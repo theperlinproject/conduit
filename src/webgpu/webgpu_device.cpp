@@ -486,8 +486,8 @@ namespace conduit::webgpu {
         if (done())
             return true;
 #if defined(__EMSCRIPTEN__)
-        (void)timeoutNs;
-        wgpuInstanceProcessEvents(instance.Get());
+        (void)timeout_ns;
+        wgpuInstanceProcessEvents(instance_.get());
         return done();
 #else
         const auto start = std::chrono::steady_clock::now();
@@ -533,7 +533,7 @@ namespace conduit::webgpu {
         if (!device_)
             return;
 #if defined(__EMSCRIPTEN__)
-        wgpuInstanceProcessEvents(instance.Get());
+        wgpuInstanceProcessEvents(instance_.get());
 #else
         wgpuDevicePoll(device_.get(), true, nullptr);
         wgpuInstanceProcessEvents(instance_.get());

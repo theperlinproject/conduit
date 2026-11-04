@@ -1,6 +1,6 @@
 # conduit
 
-**conduit** is a cross-platform rendering hardware interface for C++23. One API drives Vulkan, Direct3D 12, Direct3D 11,
+conduit is a cross-platform rendering hardware interface for C++23. One API drives Vulkan, Direct3D 12, Direct3D 11,
 Metal and WebGPU, with a null backend for headless tests. It also picks the best API and adapter for the machine it runs on.
 
 ```cpp
@@ -104,3 +104,8 @@ exit with code 77 (skipped) on machines without a driver.
 - Handle lookups are lock free: pool pages never move, and a generation in every handle catches stale use.
 - Indirect draws use multi-draw indirect and GPU-side draw counts where the driver supports them. Otherwise they fall back to a loop.
 - Pipelines compile off the render thread where the API allows it, and pipeline caches can be saved and reloaded.
+
+## Style
+
+`.clang-format` and `.clang-tidy` define the house style: snake_case everywhere, a trailing underscore on private members,
+and no `k` prefix on constants.
