@@ -1,0 +1,89 @@
+function(conduit_test name)
+    add_executable(${name} ${name}.cpp)
+    target_link_libraries(${name} PRIVATE conduit::conduit)
+    target_include_directories(${name} PRIVATE "${PROJECT_SOURCE_DIR}/src")
+endfunction()
+
+conduit_test(null_selftest)
+add_test(NAME null_selftest COMMAND null_selftest)
+conduit_test(render_profile_test)
+add_test(NAME render_profile_test COMMAND render_profile_test)
+conduit_test(vendor_test)
+add_test(NAME vendor_test COMMAND vendor_test)
+
+find_program(CONDUIT_SLANGC slangc HINTS "${CONDUIT_DEPS_DIR}/slang/bin" DOC "slangc used to compile the test shaders")
+if(NOT CONDUIT_SLANGC)
+    message(STATUS "conduit: slangc not found, shader tests are not registered")
+    return()
+endif()
+
+set(shader_root "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+set(pack "${CMAKE_CURRENT_BINARY_DIR}/test_shaders.pack")
+set(pack_targets spirv hlsl msl wgsl)
+set(dxc_dir "")
+if(CONDUIT_DEPS_DIR AND EXISTS "${CONDUIT_DEPS_DIR}/dxc/lib")
+    set(dxc_dir "${CONDUIT_DEPS_DIR}/dxc/lib")
+    list(APPEND pack_targets dxil)
+endif()
+file(GLOB programs CONFIGURE_DEPENDS "${shader_root}/programs/*.slang")
+conduit_add_shader_pack(conduit_test_pack
+    OUTPUT "${pack}"
+    SLOTS "${shader_root}/texture_slots.json"
+    SLANGC "${CONDUIT_SLANGC}"
+    TARGETS ${pack_targets}
+    LIBRARY_PATH "${dxc_dir}"
+    PROGRAMS "${shader_root}/programs"
+    DEPENDS ${programs})
+
+conduit_test(shader_library_test)
+add_dependencies(shader_library_test conduit_test_pack)
+add_test(NAME shader_library_test COMMAND shader_library_test "${pack}")
+
+conduit_test(pipeline_smoke)
+add_dependencies(pipeline_smoke conduit_test_pack)
+foreach(api VULKAN D3D12)
+    if(CONDUIT_${api})
+        string(TOLOWER ${api} id)
+        add_test(NAME pipeline_smoke_${id} COMMAND pipeline_smoke "${pack}" ${id})
+        set_tests_properties(pipeline_smoke_${id} PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+endforeach()
+
+if(NOT CONDUIT_VULKAN AND NOT CONDUIT_D3D12)
+    return()
+endif()
+set(shader_out "${CMAKE_CURRENT_BINARY_DIR}/gpu_shaders")
+set(shader_files)
+foreach(entry "raster.slang;vsMain;vertex;raster.vs" "raster.slang;fsMain;fragment;raster.fs" "cull.slang;csMain;compute;cull.cs")
+    list(GET entry 0 file)
+    list(GET entry 1 entry_name)
+    list(GET entry 2 stage)
+    list(GET entry 3 out)
+    foreach(target spirv dxil)
+        if(target STREQUAL dxil AND NOT dxc_dir)
+            continue()
+        endif()
+        set(ext spv)
+        set(extra)
+        if(target STREQUAL dxil)
+            set(ext dxil)
+            set(extra -profile sm_6_2)
+        endif()
+        add_custom_command(OUTPUT "${shader_out}/${out}.${ext}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${shader_out}"
+            COMMAND "${CONDUIT_SLANGC}" "${shader_root}/${file}" -target ${target} ${extra} -entry ${entry_name} -stage ${stage}
+                    -o "${shader_out}/${out}.${ext}"
+            DEPENDS "${shader_root}/${file}" VERBATIM)
+        list(APPEND shader_files "${shader_out}/${out}.${ext}")
+    endforeach()
+endforeach()
+add_custom_target(conduit_gpu_test_shaders DEPENDS ${shader_files})
+conduit_test(gpu_selftest)
+add_dependencies(gpu_selftest conduit_gpu_test_shaders)
+foreach(api VULKAN D3D12)
+    if(CONDUIT_${api})
+        string(TOLOWER ${api} id)
+        add_test(NAME gpu_selftest_${id} COMMAND gpu_selftest "${shader_out}" ${id})
+        set_tests_properties(gpu_selftest_${id} PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+endforeach()

@@ -1,0 +1,58 @@
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-switch-missing-default-case,
+  -bugprone-branch-clone,
+  -bugprone-unchecked-optional-access,
+  performance-*,
+  -performance-enum-size,
+  -performance-avoid-endl,
+  modernize-use-override,
+  modernize-use-nullptr,
+  modernize-use-using,
+  modernize-use-emplace,
+  modernize-redundant-void-arg,
+  modernize-make-unique,
+  modernize-make-shared,
+  modernize-loop-convert,
+  modernize-deprecated-headers,
+  readability-identifier-naming,
+  readability-redundant-string-cstr,
+  readability-redundant-smartptr-get,
+  readability-container-size-empty,
+  readability-static-definition-in-anonymous-namespace,
+  readability-duplicate-include,
+  misc-definitions-in-headers,
+  misc-redundant-expression,
+  misc-unused-using-decls,
+  cppcoreguidelines-virtual-class-destructor,
+  cppcoreguidelines-slicing
+WarningsAsErrors: '*'
+HeaderFilterRegex: '(include/conduit|src)/.*'
+FormatStyle: file
+CheckOptions:
+  readability-identifier-naming.NamespaceCase: lower_case
+  readability-identifier-naming.ClassCase: lower_case
+  readability-identifier-naming.StructCase: lower_case
+  readability-identifier-naming.UnionCase: lower_case
+  readability-identifier-naming.EnumCase: lower_case
+  readability-identifier-naming.EnumConstantCase: lower_case
+  readability-identifier-naming.TypeAliasCase: lower_case
+  readability-identifier-naming.TypedefCase: lower_case
+  readability-identifier-naming.FunctionCase: lower_case
+  readability-identifier-naming.MethodCase: lower_case
+  readability-identifier-naming.VariableCase: lower_case
+  readability-identifier-naming.ParameterCase: lower_case
+  readability-identifier-naming.MemberCase: lower_case
+  readability-identifier-naming.PrivateMemberSuffix: _
+  readability-identifier-naming.ProtectedMemberSuffix: _
+  readability-identifier-naming.ConstexprVariableCase: lower_case
+  readability-identifier-naming.TemplateParameterCase: CamelCase
+  readability-identifier-naming.MacroDefinitionCase: UPPER_CASE
+  readability-identifier-naming.MacroDefinitionPrefix: CONDUIT_
+  readability-identifier-naming.MacroDefinitionIgnoredRegexp: '^(VMA_|D3D12MA_|VK_|NOMINMAX|WIN32_LEAN_AND_MEAN|CHECK).*'
+  performance-unnecessary-value-param.AllowedTypes: 'std::span;std::string_view;.*_handle$;handle<.*>'
+  bugprone-unused-return-value.AllowCastToVoid: true

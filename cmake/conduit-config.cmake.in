@@ -1,0 +1,18 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+if(NOT "@EMSCRIPTEN@")
+    find_dependency(Threads)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/conduit-targets.cmake")
+set(CONDUIT_PACK_SHADERS "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/conduit/pack_shaders.py" CACHE INTERNAL "conduit shader packer")
+include("${CMAKE_CURRENT_LIST_DIR}/conduit_shaders.cmake")
+
+set(conduit_VULKAN @CONDUIT_VULKAN@)
+set(conduit_D3D12 @CONDUIT_D3D12@)
+set(conduit_D3D11 @CONDUIT_D3D11@)
+set(conduit_METAL @CONDUIT_METAL@)
+set(conduit_WEBGPU @CONDUIT_WEBGPU@)
+
+check_required_components(conduit)

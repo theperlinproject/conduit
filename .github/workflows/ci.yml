@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.preset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, preset: linux-clang }
+          - { os: ubuntu-24.04, preset: linux-gcc }
+          - { os: windows-2022, preset: windows-clang-cl }
+          - { os: macos-15, preset: macos }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install packages
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build mesa-vulkan-drivers
+      - name: Install packages
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Developer prompt
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Fetch slang
+        shell: bash
+        run: |
+          version=2026.20
+          case "${{ runner.os }}" in
+            Linux) archive=slang-$version-linux-x86_64.tar.gz ;;
+            macOS) archive=slang-$version-macos-aarch64.zip ;;
+            Windows) archive=slang-$version-windows-x86_64.zip ;;
+          esac
+          mkdir -p deps/slang
+          curl -fsSL -o "deps/$archive" "https://github.com/shader-slang/slang/releases/download/v$version/$archive"
+          case "$archive" in
+            *.tar.gz) tar -xzf "deps/$archive" -C deps/slang ;;
+            *) unzip -q "deps/$archive" -d deps/slang ;;
+          esac
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -DCONDUIT_DEPS_DIR=${{ github.workspace }}/deps -DCONDUIT_WARNINGS_AS_ERRORS=ON
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install packages
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang-18 clang-tidy-18 clang-format-18
+      - name: Format
+        run: git ls-files '*.cpp' '*.hpp' '*.mm' | xargs clang-format-18 --dry-run --Werror
+      - name: Configure
+        run: cmake --preset linux-clang
+      - name: Tidy
+        run: run-clang-tidy-18 -quiet -p build/linux-clang "$PWD/(src|tests)/.*\\.cpp$"
