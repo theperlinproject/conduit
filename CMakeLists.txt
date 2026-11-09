@@ -117,7 +117,7 @@ if(CONDUIT_GLES)
         src/gles/gles_pipeline.cpp
         src/gles/gles_commands.cpp
         src/gles/gles_instance.cpp)
-    foreach(f spirv_cross.cpp spirv_glsl.cpp spirv_cfg.cpp spirv_parser.cpp spirv_cross_parsed_ir.cpp spirv_cross_util.cpp)
+    foreach(f spirv_cross.cpp spirv_glsl.cpp spirv_cfg.cpp spirv_parser.cpp spirv_cross_parsed_ir.cpp)
         list(APPEND CONDUIT_SOURCES "${spirv_cross_SOURCE_DIR}/${f}")
         set_source_files_properties("${spirv_cross_SOURCE_DIR}/${f}" PROPERTIES SKIP_LINTING ON COMPILE_OPTIONS "-w")
     endforeach()
@@ -223,6 +223,9 @@ endif()
 if(CONDUIT_GLES)
     target_include_directories(conduit SYSTEM PRIVATE
         "${spirv_cross_SOURCE_DIR}" "${opengl_registry_SOURCE_DIR}/api" "${egl_registry_SOURCE_DIR}/api")
+    # a private namespace: applications such as Perlin link their own SPIRV-Cross, and two copies of the same
+    # symbols would collide at link time
+    target_compile_definitions(conduit PRIVATE SPIRV_CROSS_NAMESPACE_OVERRIDE=conduit_spirv_cross)
     if(NOT EMSCRIPTEN)
         target_link_libraries(conduit PUBLIC ${CMAKE_DL_LIBS})
     else()

@@ -2,6 +2,10 @@
 
 #include <spirv_glsl.hpp>
 
+// conduit builds its own SPIRV-Cross in a private namespace (SPIRV_CROSS_NAMESPACE_OVERRIDE) so it can link next to an
+// application that ships a different SPIRV-Cross build
+namespace sc = SPIRV_CROSS_NAMESPACE;
+
 #include <set>
 
 // Conduit shaders are SPIR-V written for Vulkan. OpenGL ES wants GLSL ES, with its bindings assigned by the program
@@ -36,7 +40,7 @@ namespace conduit::gles {
                          uint32_t glsl_version, const pipeline_layout& layout, translated_stage& out,
                          std::string& error) {
         try {
-            spirv_cross::CompilerGLSL compiler(words);
+            sc::CompilerGLSL compiler(words);
             const spv::ExecutionModel model = model_of(stage);
 
             std::string entry_name = entry;
@@ -59,7 +63,7 @@ namespace conduit::gles {
             }
             compiler.set_entry_point(entry_name, model);
 
-            spirv_cross::CompilerGLSL::Options options;
+            sc::CompilerGLSL::Options options;
             options.es = true;
             options.version = glsl_version;
             options.enable_420pack_extension = false;
@@ -69,14 +73,14 @@ namespace conduit::gles {
             options.vertex.fixup_clipspace = true;
             options.vertex.flip_vert_y = true;
             options.vertex.support_nonzero_base_instance = false;
-            options.fragment.default_float_precision = spirv_cross::CompilerGLSL::Options::Highp;
-            options.fragment.default_int_precision = spirv_cross::CompilerGLSL::Options::Highp;
+            options.fragment.default_float_precision = sc::CompilerGLSL::Options::Highp;
+            options.fragment.default_int_precision = sc::CompilerGLSL::Options::Highp;
             compiler.set_common_options(options);
 
-            const spirv_cross::ShaderResources resources = compiler.get_shader_resources();
+            const sc::ShaderResources resources = compiler.get_shader_resources();
             const char suffix = suffix_of(stage);
 
-            const auto slot_of = [&](const spirv_cross::Resource& r, uint32_t& set, uint32_t& binding) {
+            const auto slot_of = [&](const sc::Resource& r, uint32_t& set, uint32_t& binding) {
                 set = compiler.get_decoration(r.id, spv::DecorationDescriptorSet);
                 binding = compiler.get_decoration(r.id, spv::DecorationBinding);
                 return layout.find(set, binding);
@@ -87,7 +91,7 @@ namespace conduit::gles {
                 return false;
             };
 
-            for (const spirv_cross::Resource& ub : resources.uniform_buffers) {
+            for (const sc::Resource& ub : resources.uniform_buffers) {
                 uint32_t set = 0, binding = 0;
                 const layout_slot* slot = slot_of(ub, set, binding);
                 if (!slot || !is_uniform(slot->type))
@@ -100,7 +104,7 @@ namespace conduit::gles {
                 out.uniform_blocks.push_back({name, slot->index});
             }
 
-            for (const spirv_cross::Resource& pc : resources.push_constant_buffers) {
+            for (const sc::Resource& pc : resources.push_constant_buffers) {
                 if (layout.push_slot == ~0u) {
                     error = "the shader uses push constants but the pipeline layout reserves none";
                     return false;
@@ -115,7 +119,7 @@ namespace conduit::gles {
                     out.push_bytes, static_cast<uint32_t>(compiler.get_declared_struct_size(compiler.get_type(pc.base_type_id))));
             }
 
-            for (const spirv_cross::Resource& sb : resources.storage_buffers) {
+            for (const sc::Resource& sb : resources.storage_buffers) {
                 if (glsl_version < 310) {
                     error = "storage buffers need OpenGL ES 3.1";
                     return false;
@@ -132,7 +136,7 @@ namespace conduit::gles {
                 out.needs_storage = true;
             }
 
-            for (const spirv_cross::Resource& img : resources.storage_images) {
+            for (const sc::Resource& img : resources.storage_images) {
                 if (glsl_version < 310) {
                     error = "storage images need OpenGL ES 3.1";
                     return false;
@@ -150,7 +154,7 @@ namespace conduit::gles {
                 error = "subpass inputs are not available in OpenGL ES";
                 return false;
             }
-            const auto target_of = [&](const spirv_cross::SPIRType& type, GLenum& target) {
+            const auto target_of = [&](const sc::SPIRType& type, GLenum& target) {
                 if (type.image.ms) {
                     error = "multisampled textures cannot be sampled in OpenGL ES here";
                     return false;
@@ -181,7 +185,7 @@ namespace conduit::gles {
             std::set<std::string> seen;
             // a texture that is already combined with its sampler in the shader: it follows conduit's numbering, the
             // sampler sits at the binding after the texture
-            for (const spirv_cross::Resource& si : resources.sampled_images) {
+            for (const sc::Resource& si : resources.sampled_images) {
                 translated_sampler s;
                 s.set = compiler.get_decoration(si.id, spv::DecorationDescriptorSet);
                 s.binding = compiler.get_decoration(si.id, spv::DecorationBinding);
@@ -206,16 +210,16 @@ namespace conduit::gles {
 
             // the texture of each combined sampler, so its GL texture target is known
             std::map<uint32_t, GLenum> targets;
-            for (const spirv_cross::Resource& img : resources.separate_images) {
+            for (const sc::Resource& img : resources.separate_images) {
                 GLenum target = GL_TEXTURE_2D;
                 if (!target_of(compiler.get_type(img.type_id), target))
                     return false;
                 targets[img.id] = target;
             }
 
-            const spirv_cross::VariableID dummy = compiler.build_dummy_sampler_for_combined_images();
+            const sc::VariableID dummy = compiler.build_dummy_sampler_for_combined_images();
             compiler.build_combined_image_samplers();
-            for (const spirv_cross::CombinedImageSampler& cs : compiler.get_combined_image_samplers()) {
+            for (const sc::CombinedImageSampler& cs : compiler.get_combined_image_samplers()) {
                 translated_sampler s;
                 s.set = compiler.get_decoration(cs.image_id, spv::DecorationDescriptorSet);
                 s.binding = compiler.get_decoration(cs.image_id, spv::DecorationBinding);
@@ -246,15 +250,15 @@ namespace conduit::gles {
 
             // before ES 3.1 the stages meet by name rather than by location, so a varying is named after its location
             if (stage == shader_stage::vertex)
-                for (const spirv_cross::Resource& r : resources.stage_outputs)
+                for (const sc::Resource& r : resources.stage_outputs)
                     compiler.set_name(r.id, "cdt_v" + std::to_string(compiler.get_decoration(r.id, spv::DecorationLocation)));
             if (stage == shader_stage::fragment)
-                for (const spirv_cross::Resource& r : resources.stage_inputs)
+                for (const sc::Resource& r : resources.stage_inputs)
                     compiler.set_name(r.id, "cdt_v" + std::to_string(compiler.get_decoration(r.id, spv::DecorationLocation)));
 
             out.glsl = compiler.compile();
             return true;
-        } catch (const spirv_cross::CompilerError& e) {
+        } catch (const sc::CompilerError& e) {
             error = std::string("SPIRV-Cross: ") + e.what();
         } catch (const std::exception& e) {
             error = std::string("shader translation failed: ") + e.what();
