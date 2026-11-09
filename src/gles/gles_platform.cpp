@@ -65,10 +65,11 @@ namespace conduit::gles {
     namespace {
         const char* canvas_selector() {
 #ifdef CONDUIT_GLES_CANVAS
-            return CONDUIT_GLES_CANVAS;
-#else
-            return "#canvas";
+            // an empty definition (a build that lost the value) falls back to the default
+            if (sizeof(CONDUIT_GLES_CANVAS) > 1)
+                return CONDUIT_GLES_CANVAS;
 #endif
+            return "#canvas";
         }
 
         EM_JS(int, conduit_gles_probe, (char* vendor, char* renderer, int capacity), {
@@ -93,7 +94,8 @@ namespace conduit::gles {
 
         class web_surface final : public gl_surface {
         public:
-            explicit web_surface(const char* selector) : selector_(selector ? selector : canvas_selector()) {}
+            explicit web_surface(const char* selector)
+                : selector_(selector && selector[0] ? selector : canvas_selector()) {}
             bool bind() override { return true; }
             // the browser presents the canvas when control returns to its event loop
             void swap() override {}
@@ -158,7 +160,9 @@ namespace conduit::gles {
                 return true;
             }
 
-            bool make_current() override { return emscripten_webgl_make_current(context_) == EMSCRIPTEN_RESULT_SUCCESS; }
+            bool make_current() override {
+                return emscripten_webgl_make_context_current(context_) == EMSCRIPTEN_RESULT_SUCCESS;
+            }
             void release() override {}
             void* get_proc(const char*) override { return nullptr; }
             std::unique_ptr<gl_surface> create_surface(const native_window& window, uint32_t, uint32_t) override {

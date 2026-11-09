@@ -82,10 +82,10 @@ namespace conduit::gles {
 
         // runs in order and waits for the result
         template <class F> auto call(F&& fn) -> std::invoke_result_t<F> {
-            using result = std::invoke_result_t<F>;
 #ifdef __EMSCRIPTEN__
             return fn();
 #else
+            using result = std::invoke_result_t<F>;
             if (!thread_.joinable() || on_thread())
                 return fn();
             auto task = std::make_shared<std::packaged_task<result()>>(std::forward<F>(fn));
