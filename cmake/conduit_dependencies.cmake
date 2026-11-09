@@ -23,6 +23,12 @@ if(CONDUIT_VULKAN)
     conduit_dependency(vma vma https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git v3.5.0)
 endif()
 
+if(CONDUIT_GLES)
+    conduit_dependency(spirv_cross SPIRV-Cross https://github.com/KhronosGroup/SPIRV-Cross.git vulkan-sdk-1.4.328.1)
+    conduit_dependency(opengl_registry OpenGL-Registry https://github.com/KhronosGroup/OpenGL-Registry.git main)
+    conduit_dependency(egl_registry EGL-Registry https://github.com/KhronosGroup/EGL-Registry.git main)
+endif()
+
 if(CONDUIT_D3D12)
     conduit_dependency(directx_headers DirectX-Headers https://github.com/microsoft/DirectX-Headers.git faf928dc6feb8b86e9e3d6a39fc5171de7d8ac36)
     conduit_dependency(d3d12ma d3d12ma https://github.com/GPUOpen-LibrariesAndSDKs/D3D12MemoryAllocator.git v3.2.1)

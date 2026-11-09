@@ -14,5 +14,6 @@ set(conduit_D3D12 @CONDUIT_D3D12@)
 set(conduit_D3D11 @CONDUIT_D3D11@)
 set(conduit_METAL @CONDUIT_METAL@)
 set(conduit_WEBGPU @CONDUIT_WEBGPU@)
+set(conduit_GLES @CONDUIT_GLES@)
 
 check_required_components(conduit)

@@ -6,7 +6,7 @@
 namespace conduit {
     conduit::api api_from_id(std::string_view id) {
         for (conduit::api api : {conduit::api::vulkan, conduit::api::d3d12, conduit::api::d3d11, conduit::api::metal,
-                                 conduit::api::webgpu})
+                                 conduit::api::webgpu, conduit::api::gles})
             if (id == api_id(api))
                 return api;
         if (id == "dx12" || id == "directx12")
@@ -17,6 +17,8 @@ namespace conduit {
             return conduit::api::vulkan;
         if (id == "mtl")
             return conduit::api::metal;
+        if (id == "opengles" || id == "es" || id == "webgl" || id == "webgl2")
+            return conduit::api::gles;
         return conduit::api::none;
     }
 
@@ -100,6 +102,10 @@ namespace conduit {
         case conduit::api::webgpu:
             return true;
 #endif
+#if CONDUIT_HAS_GLES
+        case conduit::api::gles:
+            return true;
+#endif
         case conduit::api::none:
             return true;
         default:
@@ -110,7 +116,7 @@ namespace conduit {
     std::vector<conduit::api> compiled_apis() {
         std::vector<conduit::api> out;
         for (conduit::api api : {conduit::api::vulkan, conduit::api::d3d12, conduit::api::d3d11, conduit::api::metal,
-                                 conduit::api::webgpu})
+                                 conduit::api::webgpu, conduit::api::gles})
             if (api_compiled_in(api))
                 out.push_back(api);
         return out;
@@ -139,6 +145,10 @@ namespace conduit {
 #if CONDUIT_HAS_WEBGPU
         case conduit::api::webgpu:
             return backends::create_webgpu_instance(options);
+#endif
+#if CONDUIT_HAS_GLES
+        case conduit::api::gles:
+            return backends::create_gles_instance(options);
 #endif
         default:
             return nullptr;

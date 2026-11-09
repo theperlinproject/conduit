@@ -11,6 +11,8 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -118,17 +120,56 @@ namespace conduit::vk {
         uint32_t count = 0;
     };
 
-    struct fence_rec {
+    // a VkFence that goes back to the device's pool once nothing waits on it any more
+    struct pooled_fence {
+        VkFence fence = VK_NULL_HANDLE;
+    };
+
+    // a monotonically increasing counter the gpu signals. With VK_KHR_timeline_semaphore (core in 1.2) it is a
+    // timeline semaphore; on Vulkan 1.1 drivers without it, it is emulated with one VkFence per submission, and
+    // gpu-side waits become cpu waits on those fences
+    struct timeline {
         VkSemaphore semaphore = VK_NULL_HANDLE;
+        std::mutex mutex;
+        std::condition_variable changed;
+        uint64_t done = 0;
+        uint64_t submitted = 0;
+        struct pending {
+            uint64_t value = 0;
+            std::shared_ptr<pooled_fence> fence;
+        };
+        std::vector<pending> inflight;
+    };
+
+    struct fence_rec {
+        std::shared_ptr<vk::timeline> timeline;
     };
 
     struct queue_info {
         VkQueue queue = VK_NULL_HANDLE;
         uint32_t family = 0;
         std::mutex* mutex = nullptr;
-        VkSemaphore timeline = VK_NULL_HANDLE;
+        std::shared_ptr<vk::timeline> timeline;
         std::atomic<uint64_t> serial{0};
         bool shared = false;
+    };
+
+    struct timeline_op {
+        timeline* target = nullptr;
+        uint64_t value = 0;
+    };
+
+    // everything that decides whether two render passes can be swapped for one another or not
+    struct render_pass_key {
+        uint32_t color_count = 0;
+        std::array<VkFormat, max_color_targets> color_format{};
+        std::array<uint8_t, max_color_targets> color_load{}, color_store{}, color_resolve{};
+        VkFormat depth_format = VK_FORMAT_UNDEFINED;
+        bool depth_stencil = false;
+        uint8_t depth_load = 0, depth_store = 0;
+        bool depth_read_only = false;
+        uint32_t samples = 1;
+        bool operator==(const render_pass_key&) const = default;
     };
 
     class device;
@@ -313,6 +354,17 @@ namespace conduit::vk {
         queue_serials completed();
         void set_pending_acquire(VkSemaphore s) { pending_acquire_ = s; }
         void submit_present(VkSemaphore render_done);
+
+        // paths that depend on what the driver has. Vulkan 1.3 (or the KHR extensions on 1.2) takes the first
+        // branch of each; Vulkan 1.1 drivers get render passes, classic barriers and fence emulation instead
+        bool has_dynamic_rendering() const { return dynamic_rendering_; }
+        bool has_sync2() const { return sync2_; }
+        bool has_timeline_semaphores() const { return timeline_native_; }
+        void pipeline_barrier(VkCommandBuffer cmd, const VkDependencyInfo& info);
+        void write_timestamp(VkCommandBuffer cmd, VkQueryPool pool, uint32_t index);
+        VkRenderPass render_pass(const render_pass_key& key);
+        VkFramebuffer make_framebuffer(VkRenderPass pass, const VkImageView* views, uint32_t count, uint32_t width,
+                                       uint32_t height);
         VkQueue present_queue() const { return queues_[0].queue; }
         std::mutex* present_mutex() const { return queues_[0].mutex; }
 
@@ -329,6 +381,9 @@ namespace conduit::vk {
         bool use_validator_ = false;
 
         bool dynamic_rendering_ext_ = false;
+        bool dynamic_rendering_ = false;
+        bool sync2_ = false;
+        bool timeline_native_ = false;
         bool host_query_reset_ = false;
         bool depth_clip_enable_ = false;
         bool swapchain_ext_ = false;
@@ -361,6 +416,26 @@ namespace conduit::vk {
         VkDescriptorPool new_descriptor_pool(bool freeable);
         VkDescriptorSet allocate_set(VkDescriptorSetLayout layout, bool per_frame, VkDescriptorPool& pool_out);
         void fill_caps(const adapter_info& adapter);
+
+        std::shared_ptr<timeline> make_timeline(uint64_t initial);
+        void release_timeline(std::shared_ptr<timeline>& t);
+        uint64_t timeline_value(timeline& t);
+        bool timeline_wait(timeline& t, uint64_t value, uint64_t timeout_ns);
+        void timeline_signal(timeline& t, uint64_t value);
+        void poll_timeline(timeline& t);
+        std::shared_ptr<pooled_fence> acquire_fence();
+        VkResult queue_submit(queue_info& q, std::span<const VkCommandBuffer> cmds, std::span<const timeline_op> waits,
+                              std::span<const timeline_op> signals, VkSemaphore binary_wait,
+                              VkSemaphore binary_signal);
+
+        std::mutex fence_pool_mutex_;
+        std::vector<VkFence> free_fences_;
+        std::vector<VkFence> all_fences_;
+
+        std::mutex render_pass_mutex_;
+        std::vector<std::pair<render_pass_key, VkRenderPass>> render_passes_;
+        std::mutex framebuffer_mutex_;
+        std::vector<std::vector<VkFramebuffer>> slot_framebuffers_;
 
         std::mutex view_mutex_;
         std::mutex sampler_mutex_;

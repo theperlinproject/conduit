@@ -23,7 +23,8 @@ VERSION = 1
 STAGES = {'vertex': (0, 'vsMain'), 'fragment': (1, 'fsMain'), 'compute': (2, 'csMain')}
 # target id, slangc target, extra arguments, file extension
 TARGETS = {
-    'spirv': (0, 'spirv', []),
+    # SPIR-V 1.3 is what Vulkan 1.1 devices accept and what SPIRV-Cross reads for OpenGL ES
+    'spirv': (0, 'spirv', ['-profile', 'spirv_1_3']),
     'dxil': (1, 'dxil', ['-profile', 'sm_6_0']),
     'hlsl': (2, 'hlsl', ['-profile', 'sm_5_0']),
     'msl': (3, 'metal', []),

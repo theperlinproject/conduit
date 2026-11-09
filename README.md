@@ -25,11 +25,12 @@ device->end_frame();
 
 | Backend      | Option            | Default on                  |
 |--------------|-------------------|-----------------------------|
-| Vulkan       | `CONDUIT_VULKAN`  | Windows, Linux, Android     |
+| Vulkan       | `CONDUIT_VULKAN`  | Windows, Linux, Android (1.1 or newer; 1.2 and 1.3 take the fast paths) |
 | Direct3D 12  | `CONDUIT_D3D12`   | Windows                     |
 | Direct3D 11  | `CONDUIT_D3D11`   | off                         |
 | Metal        | `CONDUIT_METAL`   | macOS, iOS                  |
 | WebGPU       | `CONDUIT_WEBGPU`  | Emscripten                  |
+| OpenGL ES 3 / WebGL 2 | `CONDUIT_GLES` | everywhere except Apple (last resort) |
 | Streamline   | `CONDUIT_STREAMLINE` | Windows x64 (DLSS, Reflex, frame generation) |
 
 Other options:
@@ -44,6 +45,24 @@ Other options:
 
 Every backend loads its driver at run time. If a loader or driver is missing, `create_instance` returns null instead of
 failing to start.
+
+## Vulkan 1.1
+
+Devices that only have Vulkan 1.1 work. Missing features are emulated with extensions or fallbacks (timeline semaphores
+through pooled fences, a render pass instead of dynamic rendering, legacy barriers). That code only runs when the feature
+is absent, so Vulkan 1.2 and 1.3 devices take exactly the same paths as before. `tools/pack_shaders.py` emits SPIR-V 1.3
+so the same pack loads on 1.1 devices.
+
+## OpenGL ES and Firefox
+
+`CONDUIT_GLES` is the last-resort backend. Scoring always ranks it below every other API, so it is only picked when
+nothing else works: older phones without Vulkan 1.1, and Firefox, which has no WebGPU (Emscripten builds it as WebGL 2 on
+`#canvas`). Shaders come from the `spirv` pack and are translated at pipeline creation with SPIRV-Cross. The context
+lives on a worker thread and command lists are replayed there at submit.
+
+Limits: one GL context; no timestamps; no `draw_indexed_indirect_count`; compute, storage buffers and storage images need
+ES 3.1 (not WebGL 2); upload buffers must be `flush()`ed before GPU use; each frame ends with one blit to the window. It
+has not been run on a GPU yet, so treat it as unverified.
 
 ## Headers
 

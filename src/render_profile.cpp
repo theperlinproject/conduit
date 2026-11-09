@@ -121,6 +121,8 @@ namespace conduit {
                 return 40.0;
             case conduit::api::webgpu:
                 return 30.0;
+            case conduit::api::gles:
+                return 5.0;
             default:
                 return 0.0;
             }
@@ -134,6 +136,9 @@ namespace conduit {
         double s = api_base(a.api, windows, apple);
         if (s <= 0)
             return -1e9;
+        // OpenGL ES only wins when nothing else works at all, whatever the adapter bonuses add up to
+        if (a.api == api::gles)
+            s -= 2000.0;
         switch (a.type) {
         case adapter_type::discrete:
             s += 1000;
@@ -189,6 +194,8 @@ namespace conduit {
             level = 4;
         if (a.type == adapter_type::integrated)
             level = (std::min)(level, 2);
+        if (a.api == api::gles)
+            level = (std::min)(level, 1);
         if (c.have_caps) {
             const device_features& f = c.caps.features;
             if (!f.multi_draw_indirect)
@@ -336,7 +343,7 @@ namespace conduit {
         p.hdr = user.allow_hdr && have_caps && f.hdr_output;
 
         if (user.allow_upscaling && p.tier >= tier::low) {
-            if (best.adapter.vendor_id == vendor_id::nvidia && p.api != api::d3d11)
+            if (best.adapter.vendor_id == vendor_id::nvidia && p.api != api::d3d11 && p.api != api::gles)
                 p.upscalers.push_back(upscaler::dlss);
             if (best.adapter.vendor_id == vendor_id::intel && best.adapter.type == adapter_type::discrete)
                 p.upscalers.push_back(upscaler::xess);

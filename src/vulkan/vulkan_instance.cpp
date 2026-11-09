@@ -240,47 +240,19 @@ namespace conduit::vk {
 
                     VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
                     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-                    if (info.props.apiVersion >= VK_API_VERSION_1_2) {
+                    if (info.props.apiVersion >= VK_API_VERSION_1_2 ||
+                        info.has(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
                         props2.pNext = &driver;
                         vkGetPhysicalDeviceProperties2(dev, &props2);
                         a.driver_name = driver.driverName;
                     }
 
-                    a.usable = true;
-                    if (info.props.apiVersion < VK_API_VERSION_1_2) {
-                        a.usable = false;
-                        a.unusable_reason = "needs Vulkan 1.2";
-                    } else {
-                        const bool api13 = info.props.apiVersion >= VK_API_VERSION_1_3;
-                        VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-                        VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-                        VkPhysicalDeviceDynamicRenderingFeaturesKHR dr{
-                            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
-                        VkPhysicalDeviceSynchronization2FeaturesKHR s2{
-                            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR};
-                        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-                        f2.pNext = &v12;
-                        if (api13) {
-                            v12.pNext = &v13;
-                        } else if (info.has(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) &&
-                                   info.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
-                            v12.pNext = &dr;
-                            dr.pNext = &s2;
-                        }
-                        vkGetPhysicalDeviceFeatures2(dev, &f2);
-                        const bool dynamic_rendering = api13 ? v13.dynamicRendering : dr.dynamicRendering;
-                        const bool sync2 = api13 ? v13.synchronization2 : s2.synchronization2;
-                        if (!v12.timelineSemaphore) {
-                            a.usable = false;
-                            a.unusable_reason = "no timeline semaphores";
-                        } else if (!dynamic_rendering) {
-                            a.usable = false;
-                            a.unusable_reason = "no dynamic rendering";
-                        } else if (!sync2) {
-                            a.usable = false;
-                            a.unusable_reason = "no synchronization2";
-                        }
-                    }
+                    // Vulkan 1.1 is enough: timeline semaphores, dynamic rendering and synchronization2 are used
+                    // when the driver has them (core in 1.2 and 1.3, or the KHR extensions) and replaced by fences,
+                    // render passes and classic barriers when it does not
+                    a.usable = info.props.apiVersion >= VK_API_VERSION_1_1;
+                    if (!a.usable)
+                        a.unusable_reason = "needs Vulkan 1.1";
 
                     adapters_.push_back(std::move(a));
                     physical_.push_back(dev);

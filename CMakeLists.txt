@@ -33,6 +33,11 @@ option(CONDUIT_VULKAN "Build the Vulkan backend" ${_conduit_vulkan_default})
 option(CONDUIT_D3D12 "Build the Direct3D 12 backend" ${WIN32})
 option(CONDUIT_D3D11 "Build the Direct3D 11 backend" OFF)
 option(CONDUIT_METAL "Build the Metal backend" ${APPLE})
+set(_conduit_gles_default ON)
+if(APPLE)
+    set(_conduit_gles_default OFF)
+endif()
+option(CONDUIT_GLES "Build the OpenGL ES 3 / WebGL 2 backend (last resort for phones and Firefox)" ${_conduit_gles_default})
 option(CONDUIT_WEBGPU "Build the WebGPU backend" ${_conduit_webgpu_default})
 option(CONDUIT_STREAMLINE "Build the DLSS, Reflex and frame generation layer" ${_conduit_windows_x64})
 option(CONDUIT_BUILD_TESTS "Build the conduit tests" ${CONDUIT_TOP_LEVEL})
@@ -102,6 +107,20 @@ if(CONDUIT_WEBGPU)
         src/webgpu/webgpu_pipeline.cpp
         src/webgpu/webgpu_commands.cpp
         src/webgpu/webgpu_instance.cpp)
+endif()
+
+if(CONDUIT_GLES)
+    list(APPEND CONDUIT_SOURCES
+        src/gles/gles_platform.cpp
+        src/gles/gles_translate.cpp
+        src/gles/gles_device.cpp
+        src/gles/gles_pipeline.cpp
+        src/gles/gles_commands.cpp
+        src/gles/gles_instance.cpp)
+    foreach(f spirv_cross.cpp spirv_glsl.cpp spirv_cfg.cpp spirv_parser.cpp spirv_cross_parsed_ir.cpp spirv_cross_util.cpp)
+        list(APPEND CONDUIT_SOURCES "${spirv_cross_SOURCE_DIR}/${f}")
+        set_source_files_properties("${spirv_cross_SOURCE_DIR}/${f}" PROPERTIES SKIP_LINTING ON COMPILE_OPTIONS "-w")
+    endforeach()
 endif()
 
 set(_conduit_with_streamline OFF)
@@ -186,7 +205,7 @@ if(WIN32)
     target_compile_definitions(conduit PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
-foreach(api VULKAN D3D12 D3D11 METAL WEBGPU)
+foreach(api VULKAN D3D12 D3D11 METAL WEBGPU GLES)
     if(CONDUIT_${api})
         target_compile_definitions(conduit PUBLIC CONDUIT_HAS_${api}=1)
     endif()
@@ -198,6 +217,18 @@ if(CONDUIT_VULKAN)
     target_compile_definitions(conduit PRIVATE VK_NO_PROTOTYPES)
     if(UNIX AND NOT APPLE)
         target_link_libraries(conduit PUBLIC ${CMAKE_DL_LIBS})
+    endif()
+endif()
+
+if(CONDUIT_GLES)
+    target_include_directories(conduit SYSTEM PRIVATE
+        "${spirv_cross_SOURCE_DIR}" "${opengl_registry_SOURCE_DIR}/api" "${egl_registry_SOURCE_DIR}/api")
+    if(NOT EMSCRIPTEN)
+        target_link_libraries(conduit PUBLIC ${CMAKE_DL_LIBS})
+    else()
+        target_compile_definitions(conduit PRIVATE CONDUIT_GLES_CANVAS="#canvas")
+        target_compile_options(conduit PUBLIC -fexceptions)
+        target_link_options(conduit PUBLIC -fexceptions -sMAX_WEBGL_VERSION=2 -sFULL_ES3=1)
     endif()
 endif()
 

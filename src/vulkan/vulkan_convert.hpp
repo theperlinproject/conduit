@@ -306,4 +306,28 @@ namespace conduit::vk {
             return VK_SAMPLE_COUNT_1_BIT;
         }
     }
+
+    // classic (pre synchronization2) barrier masks, for Vulkan 1.1 drivers. The low 17 bits mean the same in both
+    // generations; the flags that only exist in the 64 bit versions fold into their older equivalents
+    inline VkPipelineStageFlags legacy_stages(VkPipelineStageFlags2 s) {
+        VkPipelineStageFlags out = static_cast<VkPipelineStageFlags>(s & 0x1FFFFull);
+        if (s & (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT |
+                 VK_PIPELINE_STAGE_2_CLEAR_BIT))
+            out |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+        if (s & (VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT))
+            out |= VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+        if (s & VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT)
+            out |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT |
+                   VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT | VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+        return out;
+    }
+
+    inline VkAccessFlags legacy_access(VkAccessFlags2 a) {
+        VkAccessFlags out = static_cast<VkAccessFlags>(a & 0x1FFFFull);
+        if (a & (VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT))
+            out |= VK_ACCESS_SHADER_READ_BIT;
+        if (a & VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
+            out |= VK_ACCESS_SHADER_WRITE_BIT;
+        return out;
+    }
 }

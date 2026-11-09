@@ -44,7 +44,10 @@ namespace conduit::vk {
     void cmd_list::end() {
         if (in_rendering_) {
             fail("command list ended inside a rendering pass");
-            device_.fn_.vkCmdEndRendering(cmd_);
+            if (device_.dynamic_rendering_)
+                device_.fn_.vkCmdEndRendering(cmd_);
+            else
+                device_.fn_.vkCmdEndRenderPass(cmd_);
             in_rendering_ = false;
         }
         device_.fn_.vkEndCommandBuffer(cmd_);
@@ -141,7 +144,7 @@ namespace conduit::vk {
         di.pImageMemoryBarriers = images.data();
         di.bufferMemoryBarrierCount = static_cast<uint32_t>(bufs.size());
         di.pBufferMemoryBarriers = bufs.data();
-        device_.fn_.vkCmdPipelineBarrier2(cmd_, &di);
+        device_.pipeline_barrier(cmd_, di);
         counters_.barriers += images.size() + bufs.size();
     }
 
@@ -157,7 +160,7 @@ namespace conduit::vk {
         VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
         di.memoryBarrierCount = 1;
         di.pMemoryBarriers = &mb;
-        device_.fn_.vkCmdPipelineBarrier2(cmd_, &di);
+        device_.pipeline_barrier(cmd_, di);
         counters_.barriers++;
     }
 
@@ -179,7 +182,7 @@ namespace conduit::vk {
         VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
         di.imageMemoryBarrierCount = 1;
         di.pImageMemoryBarriers = &b;
-        device_.fn_.vkCmdPipelineBarrier2(cmd_, &di);
+        device_.pipeline_barrier(cmd_, di);
         counters_.barriers++;
     }
 
@@ -327,6 +330,9 @@ namespace conduit::vk {
         VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         VkRenderingAttachmentInfo stencil{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         bool have_depth = false, have_stencil = false;
+        VkFormat pass_color_format[max_color_targets]{};
+        VkFormat pass_depth_format = VK_FORMAT_UNDEFINED;
+        uint32_t pass_samples = 1;
         target_width_ = target_height_ = 0;
         color_count_ = desc.color_count;
         color_formats_.fill(format::unknown);
@@ -366,6 +372,8 @@ namespace conduit::vk {
                 c.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             }
             color_formats_[i] = t->desc.format;
+            pass_color_format[i] = t->format;
+            pass_samples = t->desc.samples;
             if (!target_width_) {
                 target_width_ = mip_extent(t->desc.width, a.mip);
                 target_height_ = mip_extent(t->desc.height, a.mip);
@@ -398,6 +406,8 @@ namespace conduit::vk {
                     have_stencil = true;
                 }
                 depth_format_ = t->desc.format;
+                pass_depth_format = t->format;
+                pass_samples = t->desc.samples;
                 if (!target_width_) {
                     target_width_ = mip_extent(t->desc.width, a.mip);
                     target_height_ = mip_extent(t->desc.height, a.mip);
@@ -405,14 +415,57 @@ namespace conduit::vk {
             }
         }
 
-        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-        ri.renderArea = {{0, 0}, {target_width_, target_height_}};
-        ri.layerCount = 1;
-        ri.colorAttachmentCount = desc.color_count;
-        ri.pColorAttachments = colors;
-        ri.pDepthAttachment = have_depth ? &depth : nullptr;
-        ri.pStencilAttachment = have_stencil ? &stencil : nullptr;
-        device_.fn_.vkCmdBeginRendering(cmd_, &ri);
+        if (device_.dynamic_rendering_) {
+            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            ri.renderArea = {{0, 0}, {target_width_, target_height_}};
+            ri.layerCount = 1;
+            ri.colorAttachmentCount = desc.color_count;
+            ri.pColorAttachments = colors;
+            ri.pDepthAttachment = have_depth ? &depth : nullptr;
+            ri.pStencilAttachment = have_stencil ? &stencil : nullptr;
+            device_.fn_.vkCmdBeginRendering(cmd_, &ri);
+        } else {
+            // Vulkan 1.1 without VK_KHR_dynamic_rendering: the same pass as a render pass and a framebuffer
+            render_pass_key key;
+            key.color_count = desc.color_count;
+            key.samples = pass_samples;
+            VkImageView views[max_color_targets * 2 + 1];
+            VkClearValue clears[max_color_targets * 2 + 1]{};
+            uint32_t count = 0;
+            for (uint32_t i = 0; i < desc.color_count; i++) {
+                key.color_format[i] = pass_color_format[i];
+                key.color_load[i] = static_cast<uint8_t>(colors[i].loadOp);
+                key.color_store[i] = static_cast<uint8_t>(colors[i].storeOp);
+                key.color_resolve[i] = colors[i].resolveImageView != VK_NULL_HANDLE;
+                clears[count] = colors[i].clearValue;
+                views[count++] = colors[i].imageView;
+            }
+            for (uint32_t i = 0; i < desc.color_count; i++)
+                if (key.color_resolve[i])
+                    views[count++] = colors[i].resolveImageView;
+            if (have_depth) {
+                key.depth_format = pass_depth_format;
+                key.depth_stencil = have_stencil;
+                key.depth_load = static_cast<uint8_t>(depth.loadOp);
+                key.depth_store = static_cast<uint8_t>(depth.storeOp);
+                key.depth_read_only = desc.depth.read_only;
+                clears[count] = depth.clearValue;
+                views[count++] = depth.imageView;
+            }
+            VkRenderPass pass = device_.render_pass(key);
+            VkFramebuffer fb = device_.make_framebuffer(pass, views, count, target_width_, target_height_);
+            if (!pass || !fb) {
+                fail("BeginRendering: render pass or framebuffer creation failed");
+                return;
+            }
+            VkRenderPassBeginInfo bi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            bi.renderPass = pass;
+            bi.framebuffer = fb;
+            bi.renderArea = {{0, 0}, {target_width_, target_height_}};
+            bi.clearValueCount = count;
+            bi.pClearValues = clears;
+            device_.fn_.vkCmdBeginRenderPass(cmd_, &bi, VK_SUBPASS_CONTENTS_INLINE);
+        }
         in_rendering_ = true;
 
         set_viewport({0, 0, static_cast<float>(target_width_), static_cast<float>(target_height_), 0.0f, 1.0f});
@@ -431,7 +484,10 @@ namespace conduit::vk {
             fail("EndRendering without BeginRendering");
             return;
         }
-        device_.fn_.vkCmdEndRendering(cmd_);
+        if (device_.dynamic_rendering_)
+            device_.fn_.vkCmdEndRendering(cmd_);
+        else
+            device_.fn_.vkCmdEndRenderPass(cmd_);
         in_rendering_ = false;
     }
 
@@ -698,7 +754,7 @@ namespace conduit::vk {
             fail("WriteTimestamp: bad query set or index");
             return;
         }
-        device_.fn_.vkCmdWriteTimestamp2(cmd_, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, q->pool, index);
+        device_.write_timestamp(cmd_, q->pool, index);
     }
 
     void cmd_list::resolve_queries(query_set_handle set, uint32_t first, uint32_t count, buffer_handle dst,
@@ -716,7 +772,7 @@ namespace conduit::vk {
         VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
         di.memoryBarrierCount = 1;
         di.pMemoryBarriers = &mb;
-        device_.fn_.vkCmdPipelineBarrier2(cmd_, &di);
+        device_.pipeline_barrier(cmd_, di);
         device_.fn_.vkCmdResetQueryPool(cmd_, q->pool, first, count);
     }
 

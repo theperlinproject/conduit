@@ -8,7 +8,8 @@
 #include <vector>
 
 namespace conduit {
-    enum class api : uint8_t { none, vulkan, d3d12, d3d11, metal, webgpu };
+    // gles is the last resort: OpenGL ES 3.0 and up on phones, and WebGL 2 for browsers without WebGPU
+    enum class api : uint8_t { none, vulkan, d3d12, d3d11, metal, webgpu, gles };
 
     constexpr const char* api_name(conduit::api api) {
         switch (api) {
@@ -22,6 +23,8 @@ namespace conduit {
             return "Metal";
         case conduit::api::webgpu:
             return "WebGPU";
+        case conduit::api::gles:
+            return "OpenGL ES";
         default:
             return "None";
         }
@@ -39,6 +42,8 @@ namespace conduit {
             return "metal";
         case conduit::api::webgpu:
             return "webgpu";
+        case conduit::api::gles:
+            return "gles";
         default:
             return "none";
         }

@@ -3,6 +3,7 @@
 #include "vulkan/vulkan_convert.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <set>
@@ -50,7 +51,7 @@ namespace conduit::vk {
         pipelines_.for_each(
             [&](pipeline_handle, pipeline_rec& r) { fn_.vkDestroyPipeline(device_, r.pipeline, nullptr); });
         queries_.for_each([&](query_set_handle, query_rec& r) { fn_.vkDestroyQueryPool(device_, r.pool, nullptr); });
-        fences_.for_each([&](fence_handle, fence_rec& r) { fn_.vkDestroySemaphore(device_, r.semaphore, nullptr); });
+        fences_.for_each([&](fence_handle, fence_rec& r) { release_timeline(r.timeline); });
 
         for (VkDescriptorPool p : persistent_pools_)
             fn_.vkDestroyDescriptorPool(device_, p, nullptr);
@@ -63,8 +64,14 @@ namespace conduit::vk {
                     if (q.pool)
                         fn_.vkDestroyCommandPool(device_, q.pool, nullptr);
         for (auto& q : queues_)
-            if (q.timeline)
-                fn_.vkDestroySemaphore(device_, q.timeline, nullptr);
+            release_timeline(q.timeline);
+        for (auto& [key, pass] : render_passes_)
+            fn_.vkDestroyRenderPass(device_, pass, nullptr);
+        for (auto& list : slot_framebuffers_)
+            for (VkFramebuffer f : list)
+                fn_.vkDestroyFramebuffer(device_, f, nullptr);
+        for (VkFence f : all_fences_)
+            fn_.vkDestroyFence(device_, f, nullptr);
         if (empty_set_layout_)
             fn_.vkDestroyDescriptorSetLayout(device_, empty_set_layout_, nullptr);
         if (pipeline_cache_)
@@ -147,13 +154,35 @@ namespace conduit::vk {
         if (!pick_queues(error))
             return false;
 
+        const bool api12 = phys_.props.apiVersion >= VK_API_VERSION_1_2;
         const bool api13 = phys_.props.apiVersion >= VK_API_VERSION_1_3;
         vkGetPhysicalDeviceMemoryProperties(physical_, &mem_props_);
+
+        // Vulkan 1.1 drivers expose the 1.2 and 1.3 features this backend likes through extensions, or not at all.
+        // Each one is optional: what is missing is replaced by a slower path instead of refusing the device
+        const bool ext_timeline = !api12 && phys_.has(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+        const bool ext_bda = !api12 && phys_.has(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+        const bool ext_reset = !api12 && phys_.has(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
+        const bool ext_f16 = !api12 && phys_.has(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+        const bool ext_indexing = !api12 && phys_.has(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+        const bool ext_count = !api12 && phys_.has(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+        const bool ext_render =
+            !api13 && phys_.has(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) &&
+            (api12 || (phys_.has(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME) &&
+                       phys_.has(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME)));
+        const bool ext_sync2 = !api13 && phys_.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
 
         VkPhysicalDeviceFeatures2 sup2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         VkPhysicalDeviceVulkan11Features sup11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
         VkPhysicalDeviceVulkan12Features sup12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
         VkPhysicalDeviceVulkan13Features sup13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceTimelineSemaphoreFeatures sup_ts{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+        VkPhysicalDeviceBufferDeviceAddressFeatures sup_bda{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+        VkPhysicalDeviceHostQueryResetFeatures sup_reset{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES};
+        VkPhysicalDeviceShaderFloat16Int8Features sup_f16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
+        VkPhysicalDeviceDescriptorIndexingFeatures sup_indexing{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
         VkPhysicalDeviceDynamicRenderingFeaturesKHR sup_dr{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
         VkPhysicalDeviceSynchronization2FeaturesKHR sup_s2{
@@ -162,27 +191,61 @@ namespace conduit::vk {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
         {
             void** tail = &sup2.pNext;
-            chain(tail, &sup11);
-            tail = &sup11.pNext;
-            chain(tail, &sup12);
-            tail = &sup12.pNext;
-            if (api13) {
-                chain(tail, &sup13);
-                tail = &sup13.pNext;
-            } else {
-                chain(tail, &sup_dr, &sup_s2);
-                tail = &sup_s2.pNext;
-            }
+            auto link = [&tail](auto& st) {
+                *tail = &st;
+                tail = reinterpret_cast<void**>(&reinterpret_cast<VkBaseOutStructure*>(&st)->pNext);
+            };
+            link(sup11);
+            if (api12)
+                link(sup12);
+            if (api13)
+                link(sup13);
+            if (ext_timeline)
+                link(sup_ts);
+            if (ext_bda)
+                link(sup_bda);
+            if (ext_reset)
+                link(sup_reset);
+            if (ext_f16)
+                link(sup_f16);
+            if (ext_indexing)
+                link(sup_indexing);
+            if (ext_render)
+                link(sup_dr);
+            if (ext_sync2)
+                link(sup_s2);
             if (phys_.has(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME))
-                chain(tail, &sup_clip);
+                link(sup_clip);
             vkGetPhysicalDeviceFeatures2(physical_, &sup2);
         }
         const VkPhysicalDeviceFeatures& sf = sup2.features;
+
+        const bool f_timeline = api12 ? sup12.timelineSemaphore != 0 : (ext_timeline && sup_ts.timelineSemaphore);
+        const bool f_bda = api12 ? sup12.bufferDeviceAddress != 0 : (ext_bda && sup_bda.bufferDeviceAddress);
+        const bool f_count = api12 ? sup12.drawIndirectCount != 0 : ext_count;
+        const bool f_reset = api12 ? sup12.hostQueryReset != 0 : (ext_reset && sup_reset.hostQueryReset);
+        const bool f_f16 = api12 ? sup12.shaderFloat16 != 0 : (ext_f16 && sup_f16.shaderFloat16);
+        const bool f_runtime_array =
+            api12 ? sup12.runtimeDescriptorArray != 0 : (ext_indexing && sup_indexing.runtimeDescriptorArray);
+        const bool f_partially_bound = api12 ? sup12.descriptorBindingPartiallyBound != 0
+                                             : (ext_indexing && sup_indexing.descriptorBindingPartiallyBound);
+        const bool f_nonuniform = api12 ? sup12.shaderSampledImageArrayNonUniformIndexing != 0
+                                        : (ext_indexing && sup_indexing.shaderSampledImageArrayNonUniformIndexing);
+        dynamic_rendering_ = api13 ? sup13.dynamicRendering != 0 : (ext_render && sup_dr.dynamicRendering);
+        sync2_ = api13 ? sup13.synchronization2 != 0 : (ext_sync2 && sup_s2.synchronization2);
+        timeline_native_ = f_timeline;
 
         VkPhysicalDeviceFeatures2 en2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         VkPhysicalDeviceVulkan11Features en11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
         VkPhysicalDeviceVulkan12Features en12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
         VkPhysicalDeviceVulkan13Features en13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceTimelineSemaphoreFeatures en_ts{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+        VkPhysicalDeviceBufferDeviceAddressFeatures en_bda{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+        VkPhysicalDeviceHostQueryResetFeatures en_reset{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES};
+        VkPhysicalDeviceShaderFloat16Int8Features en_f16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
+        VkPhysicalDeviceDescriptorIndexingFeatures en_indexing{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
         VkPhysicalDeviceDynamicRenderingFeaturesKHR en_dr{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
         VkPhysicalDeviceSynchronization2FeaturesKHR en_s2{
@@ -214,15 +277,22 @@ namespace conduit::vk {
         en11.storageBuffer16BitAccess = sup11.storageBuffer16BitAccess;
         en11.uniformAndStorageBuffer16BitAccess = sup11.uniformAndStorageBuffer16BitAccess;
 
-        en12.timelineSemaphore = VK_TRUE;
-        en12.bufferDeviceAddress = sup12.bufferDeviceAddress;
-        en12.drawIndirectCount = sup12.drawIndirectCount;
-        en12.hostQueryReset = sup12.hostQueryReset;
-        en12.shaderFloat16 = sup12.shaderFloat16;
-        en12.samplerMirrorClampToEdge = sup12.samplerMirrorClampToEdge;
-        en12.runtimeDescriptorArray = sup12.runtimeDescriptorArray;
-        en12.descriptorBindingPartiallyBound = sup12.descriptorBindingPartiallyBound;
-        en12.shaderSampledImageArrayNonUniformIndexing = sup12.shaderSampledImageArrayNonUniformIndexing;
+        en12.timelineSemaphore = f_timeline;
+        en12.bufferDeviceAddress = f_bda;
+        en12.drawIndirectCount = f_count;
+        en12.hostQueryReset = f_reset;
+        en12.shaderFloat16 = f_f16;
+        en12.samplerMirrorClampToEdge = api12 ? sup12.samplerMirrorClampToEdge : VK_FALSE;
+        en12.runtimeDescriptorArray = f_runtime_array;
+        en12.descriptorBindingPartiallyBound = f_partially_bound;
+        en12.shaderSampledImageArrayNonUniformIndexing = f_nonuniform;
+        en_ts.timelineSemaphore = f_timeline;
+        en_bda.bufferDeviceAddress = f_bda;
+        en_reset.hostQueryReset = f_reset;
+        en_f16.shaderFloat16 = f_f16;
+        en_indexing.runtimeDescriptorArray = f_runtime_array;
+        en_indexing.descriptorBindingPartiallyBound = f_partially_bound;
+        en_indexing.shaderSampledImageArrayNonUniformIndexing = f_nonuniform;
 
         std::vector<const char*> extensions;
         auto enable = [&](const char* name) {
@@ -239,11 +309,33 @@ namespace conduit::vk {
             en13.synchronization2 = VK_TRUE;
             en13.maintenance4 = sup13.maintenance4;
         } else {
-            enable(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
-            enable(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
-            en_dr.dynamicRendering = VK_TRUE;
-            en_s2.synchronization2 = VK_TRUE;
-            dynamic_rendering_ext_ = true;
+            if (dynamic_rendering_) {
+                if (!api12) {
+                    enable(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);
+                    enable(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
+                }
+                enable(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+                en_dr.dynamicRendering = VK_TRUE;
+                dynamic_rendering_ext_ = true;
+            }
+            if (sync2_) {
+                enable(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+                en_s2.synchronization2 = VK_TRUE;
+            }
+        }
+        if (!api12) {
+            if (f_timeline)
+                enable(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+            if (f_bda)
+                enable(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+            if (f_reset)
+                enable(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
+            if (f_f16)
+                enable(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+            if (f_runtime_array || f_partially_bound || f_nonuniform)
+                enable(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
+            if (f_count)
+                enable(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
         }
         const bool memory_budget = enable(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
         if (sup_clip.depthClipEnable && enable(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME)) {
@@ -256,21 +348,35 @@ namespace conduit::vk {
 
         {
             void** tail = &en2.pNext;
-            chain(tail, &en11);
-            tail = &en11.pNext;
-            chain(tail, &en12);
-            tail = &en12.pNext;
-            if (api13) {
-                chain(tail, &en13);
-                tail = &en13.pNext;
+            auto link = [&tail](auto& st) {
+                *tail = &st;
+                tail = reinterpret_cast<void**>(&reinterpret_cast<VkBaseOutStructure*>(&st)->pNext);
+            };
+            link(en11);
+            if (api12) {
+                link(en12);
             } else {
-                chain(tail, &en_dr, &en_s2);
-                tail = &en_s2.pNext;
+                if (f_timeline)
+                    link(en_ts);
+                if (f_bda)
+                    link(en_bda);
+                if (f_reset)
+                    link(en_reset);
+                if (f_f16)
+                    link(en_f16);
+                if (f_runtime_array || f_partially_bound || f_nonuniform)
+                    link(en_indexing);
             }
-            if (depth_clip_enable_) {
-                chain(tail, &en_clip);
-                tail = &en_clip.pNext;
+            if (api13) {
+                link(en13);
+            } else {
+                if (dynamic_rendering_)
+                    link(en_dr);
+                if (sync2_)
+                    link(en_s2);
             }
+            if (depth_clip_enable_)
+                link(en_clip);
             *tail = options_.hooks.device_feature_chain;
         }
 
@@ -302,7 +408,7 @@ namespace conduit::vk {
         alias(fn_.vkSignalSemaphore, fn_.vkSignalSemaphoreKHR);
         alias(fn_.vkGetBufferDeviceAddress, fn_.vkGetBufferDeviceAddressKHR);
         alias(fn_.vkResetQueryPool, fn_.vkResetQueryPoolEXT);
-        host_query_reset_ = en12.hostQueryReset && fn_.vkResetQueryPool;
+        host_query_reset_ = f_reset && fn_.vkResetQueryPool;
 
         std::mutex* mutexes[queue_count] = {};
         for (size_t i = 0; i < queue_count; i++) {
@@ -316,10 +422,8 @@ namespace conduit::vk {
                 mutexes[i] = &queue_mutexes_[i];
             queues_[i].mutex = mutexes[i];
 
-            VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
-            type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-            VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
-            if (fn_.vkCreateSemaphore(device_, &sci, nullptr, &queues_[i].timeline) != VK_SUCCESS) {
+            queues_[i].timeline = make_timeline(0);
+            if (!queues_[i].timeline) {
                 error = "timeline semaphore creation failed";
                 return false;
             }
@@ -335,7 +439,7 @@ namespace conduit::vk {
         ai.vulkanApiVersion = (std::min)(phys_.props.apiVersion, inst_->api_version);
         ai.preferredLargeHeapBlockSize = 32ull << 20;
         ai.pVulkanFunctions = &vf;
-        if (en12.bufferDeviceAddress)
+        if (f_bda)
             ai.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
         if (memory_budget)
             ai.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
@@ -357,22 +461,22 @@ namespace conduit::vk {
         fn_.vkCreateDescriptorSetLayout(device_, &empty, nullptr, &empty_set_layout_);
 
         frame_descriptors_.resize(options_.frames_in_flight);
+        slot_framebuffers_.resize(options_.frames_in_flight);
         slot_serials_.assign(options_.frames_in_flight, queue_serials{});
 
-        caps_.features.buffer_device_address = en12.bufferDeviceAddress;
+        caps_.features.buffer_device_address = f_bda;
         fill_caps(caps_.adapter);
         caps_.features.multi_draw_indirect = ef.multiDrawIndirect && ef.drawIndirectFirstInstance;
         caps_.features.draw_indirect_first_instance = ef.drawIndirectFirstInstance;
-        caps_.features.draw_indirect_count = en12.drawIndirectCount;
+        caps_.features.draw_indirect_count = f_count && fn_.vkCmdDrawIndexedIndirectCount;
         caps_.features.sampler_anisotropy = ef.samplerAnisotropy;
         caps_.features.texture_compression_bc = ef.textureCompressionBC;
-        caps_.features.shader_float16 = en12.shaderFloat16;
+        caps_.features.shader_float16 = f_f16;
         caps_.features.shader_int64 = ef.shaderInt64;
         caps_.features.shader_float64 = ef.shaderFloat64;
         caps_.features.depth_clip_control = depth_clip_enable_;
-        caps_.features.bindless = en12.runtimeDescriptorArray && en12.descriptorBindingPartiallyBound &&
-                                  en12.shaderSampledImageArrayNonUniformIndexing;
-        caps_.features.enhanced_barriers = true;
+        caps_.features.bindless = f_runtime_array && f_partially_bound && f_nonuniform;
+        caps_.features.enhanced_barriers = sync2_;
         caps_.features.timestamp_queries = phys_.props.limits.timestampComputeAndGraphics != 0;
         caps_.features.pipeline_cache_blob = true;
         caps_.features.async_compute = queues_[1].queue != queues_[0].queue;
@@ -522,9 +626,7 @@ namespace conduit::vk {
     queue_serials device::completed() {
         queue_serials out{};
         for (size_t i = 0; i < queue_count; i++) {
-            uint64_t value = 0;
-            fn_.vkGetSemaphoreCounterValue(device_, queues_[i].timeline, &value);
-            out[i] = value;
+            out[i] = timeline_value(*queues_[i].timeline);
         }
         return out;
     }
@@ -1243,6 +1345,7 @@ namespace conduit::vk {
         for (uint32_t i = 0; i < desc.color_count; i++)
             color_formats[i] = format_to_vk(desc.color_formats[i]);
         VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        render_pass_key pass_key;
         ri.colorAttachmentCount = desc.color_count;
         ri.pColorAttachmentFormats = color_formats;
         if (desc.depth_format != format::unknown) {
@@ -1252,7 +1355,22 @@ namespace conduit::vk {
         }
 
         VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-        pi.pNext = &ri;
+        if (dynamic_rendering_) {
+            pi.pNext = &ri;
+        } else {
+            // a render pass with the same formats and sample count stands in for the attachments
+            pass_key.color_count = desc.color_count;
+            for (uint32_t i = 0; i < desc.color_count; i++) {
+                pass_key.color_format[i] = color_formats[i];
+                pass_key.color_store[i] = VK_ATTACHMENT_STORE_OP_STORE;
+            }
+            pass_key.depth_format = ri.depthAttachmentFormat;
+            pass_key.depth_stencil = ri.stencilAttachmentFormat != VK_FORMAT_UNDEFINED;
+            pass_key.depth_store = VK_ATTACHMENT_STORE_OP_STORE;
+            pass_key.samples = desc.samples;
+            pi.renderPass = render_pass(pass_key);
+            pi.subpass = 0;
+        }
         pi.stageCount = stage_count;
         pi.pStages = stages;
         pi.pVertexInputState = &vi;
@@ -1412,7 +1530,7 @@ namespace conduit::vk {
         fence_rec rec;
         if (!fences_.free(h, &rec))
             return;
-        retire([this, s = rec.semaphore] { fn_.vkDestroySemaphore(device_, s, nullptr); });
+        retire([this, t = std::move(rec.timeline)]() mutable { release_timeline(t); });
     }
 
     const buffer_desc* device::get_desc(buffer_handle h) const {
@@ -1448,43 +1566,26 @@ namespace conduit::vk {
     }
 
     fence_handle device::create_fence(uint64_t initial) {
-        VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
-        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-        type.initialValue = initial;
-        VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
         fence_rec rec;
-        if (fn_.vkCreateSemaphore(device_, &si, nullptr, &rec.semaphore) != VK_SUCCESS)
+        rec.timeline = make_timeline(initial);
+        if (!rec.timeline)
             return {};
         return fences_.alloc(rec);
     }
 
     uint64_t device::fence_value(fence_handle h) {
         fence_rec* f = fences_.get(h);
-        uint64_t value = 0;
-        if (f)
-            fn_.vkGetSemaphoreCounterValue(device_, f->semaphore, &value);
-        return value;
+        return f ? timeline_value(*f->timeline) : 0;
     }
 
     bool device::wait_fence(fence_handle h, uint64_t value, uint64_t timeout_ns) {
         fence_rec* f = fences_.get(h);
-        if (!f)
-            return false;
-        VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-        wi.semaphoreCount = 1;
-        wi.pSemaphores = &f->semaphore;
-        wi.pValues = &value;
-        return fn_.vkWaitSemaphores(device_, &wi, timeout_ns) == VK_SUCCESS;
+        return f && timeline_wait(*f->timeline, value, timeout_ns);
     }
 
     void device::signal_fence(fence_handle h, uint64_t value) {
-        fence_rec* f = fences_.get(h);
-        if (!f)
-            return;
-        VkSemaphoreSignalInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
-        si.semaphore = f->semaphore;
-        si.value = value;
-        fn_.vkSignalSemaphore(device_, &si);
+        if (fence_rec* f = fences_.get(h))
+            timeline_signal(*f->timeline, value);
     }
 
     thread_pools& device::pools_for_this_thread() {
@@ -1529,7 +1630,7 @@ namespace conduit::vk {
 
     void device::submit(conduit::queue_type queue_type, const submit_desc& desc) {
         queue_info& q = queues_[static_cast<size_t>(queue_type)];
-        std::vector<VkCommandBufferSubmitInfo> cmds;
+        std::vector<VkCommandBuffer> cmds;
         cmds.reserve(desc.lists.size());
         for (command_list* list : desc.lists) {
             auto* vk_list = static_cast<cmd_list*>(list);
@@ -1537,74 +1638,451 @@ namespace conduit::vk {
                 report_error("command list submitted with an open debug label");
             vk_list->end();
             counters_.add(vk_list->counters());
-            VkCommandBufferSubmitInfo ci{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
-            ci.commandBuffer = vk_list->cmd();
-            cmds.push_back(ci);
+            cmds.push_back(vk_list->cmd());
         }
 
-        std::vector<VkSemaphoreSubmitInfo> waits, signals;
-        auto sem_info = [](VkSemaphore s, uint64_t value) {
-            VkSemaphoreSubmitInfo i{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
-            i.semaphore = s;
-            i.value = value;
-            i.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-            return i;
-        };
+        std::vector<timeline_op> waits, signals;
         for (const fence_op& w : desc.waits)
             if (fence_rec* f = fences_.get(w.fence))
-                waits.push_back(sem_info(f->semaphore, w.value));
-        if (queue_type == conduit::queue_type::graphics)
-            if (VkSemaphore acquire = pending_acquire_.exchange(VK_NULL_HANDLE))
-                waits.push_back(sem_info(acquire, 0));
+                waits.push_back({f->timeline.get(), w.value});
         for (const fence_op& s : desc.signals)
             if (fence_rec* f = fences_.get(s.fence))
-                signals.push_back(sem_info(f->semaphore, s.value));
+                signals.push_back({f->timeline.get(), s.value});
+        VkSemaphore acquire = VK_NULL_HANDLE;
+        if (queue_type == conduit::queue_type::graphics)
+            acquire = pending_acquire_.exchange(VK_NULL_HANDLE);
 
-        std::lock_guard lock(*q.mutex);
-        const uint64_t serial = q.serial.load() + 1;
-        signals.push_back(sem_info(q.timeline, serial));
-
-        VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-        si.waitSemaphoreInfoCount = static_cast<uint32_t>(waits.size());
-        si.pWaitSemaphoreInfos = waits.data();
-        si.commandBufferInfoCount = static_cast<uint32_t>(cmds.size());
-        si.pCommandBufferInfos = cmds.data();
-        si.signalSemaphoreInfoCount = static_cast<uint32_t>(signals.size());
-        si.pSignalSemaphoreInfos = signals.data();
-        const VkResult r = fn_.vkQueueSubmit2(q.queue, 1, &si, VK_NULL_HANDLE);
+        const VkResult r = queue_submit(q, cmds, waits, signals, acquire, VK_NULL_HANDLE);
         if (r != VK_SUCCESS) {
-            report_error("vkQueueSubmit2 failed (" + std::to_string(r) + ")");
+            report_error("queue submit failed (" + std::to_string(r) + ")");
             lost_ = (r == VK_ERROR_DEVICE_LOST);
             return;
         }
-        q.serial.store(serial);
         counters_.count_submit();
     }
 
     void device::submit_present(VkSemaphore render_done) {
-        queue_info& q = queues_[0];
-        VkSemaphoreSubmitInfo signals[2]{};
-        signals[0] = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, nullptr, render_done, 0,
-                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,    0};
-        VkSemaphoreSubmitInfo waits[1]{};
-        uint32_t wait_count = 0;
-        if (VkSemaphore acquire = pending_acquire_.exchange(VK_NULL_HANDLE)) {
-            waits[wait_count++] = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, nullptr, acquire, 0,
-                                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,    0};
+        VkSemaphore acquire = pending_acquire_.exchange(VK_NULL_HANDLE);
+        if (queue_submit(queues_[0], {}, {}, {}, acquire, render_done) != VK_SUCCESS)
+            report_error("present submit failed");
+    }
+
+    // One submission, whatever the driver offers: synchronization2 plus timeline semaphores (Vulkan 1.3, the fast
+    // path), timeline semaphores with classic submits, or on Vulkan 1.1 drivers without them a VkFence per submit
+    // that the timelines track, with gpu waits turned into cpu waits.
+    VkResult device::queue_submit(queue_info& q, std::span<const VkCommandBuffer> cmds,
+                                  std::span<const timeline_op> waits, std::span<const timeline_op> signals,
+                                  VkSemaphore binary_wait, VkSemaphore binary_signal) {
+        if (timeline_native_ && sync2_) {
+            std::vector<VkCommandBufferSubmitInfo> infos;
+            infos.reserve(cmds.size());
+            for (VkCommandBuffer c : cmds) {
+                VkCommandBufferSubmitInfo ci{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+                ci.commandBuffer = c;
+                infos.push_back(ci);
+            }
+            std::vector<VkSemaphoreSubmitInfo> wait_infos, signal_infos;
+            auto sem_info = [](VkSemaphore s, uint64_t value) {
+                VkSemaphoreSubmitInfo i{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+                i.semaphore = s;
+                i.value = value;
+                i.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                return i;
+            };
+            for (const timeline_op& w : waits)
+                wait_infos.push_back(sem_info(w.target->semaphore, w.value));
+            if (binary_wait)
+                wait_infos.push_back(sem_info(binary_wait, 0));
+            for (const timeline_op& s : signals)
+                signal_infos.push_back(sem_info(s.target->semaphore, s.value));
+            if (binary_signal)
+                signal_infos.push_back(sem_info(binary_signal, 0));
+
+            std::lock_guard lock(*q.mutex);
+            const uint64_t serial = q.serial.load() + 1;
+            signal_infos.push_back(sem_info(q.timeline->semaphore, serial));
+            VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+            si.waitSemaphoreInfoCount = static_cast<uint32_t>(wait_infos.size());
+            si.pWaitSemaphoreInfos = wait_infos.data();
+            si.commandBufferInfoCount = static_cast<uint32_t>(infos.size());
+            si.pCommandBufferInfos = infos.data();
+            si.signalSemaphoreInfoCount = static_cast<uint32_t>(signal_infos.size());
+            si.pSignalSemaphoreInfos = signal_infos.data();
+            const VkResult r = fn_.vkQueueSubmit2(q.queue, 1, &si, VK_NULL_HANDLE);
+            if (r == VK_SUCCESS)
+                q.serial.store(serial);
+            return r;
+        }
+
+        std::vector<VkSemaphore> wait_sems, signal_sems;
+        std::vector<VkPipelineStageFlags> wait_stages;
+        std::vector<uint64_t> wait_values, signal_values;
+
+        if (timeline_native_) {
+            for (const timeline_op& w : waits) {
+                wait_sems.push_back(w.target->semaphore);
+                wait_values.push_back(w.value);
+            }
+            if (binary_wait) {
+                wait_sems.push_back(binary_wait);
+                wait_values.push_back(0);
+            }
+            wait_stages.assign(wait_sems.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            for (const timeline_op& s : signals) {
+                signal_sems.push_back(s.target->semaphore);
+                signal_values.push_back(s.value);
+            }
+            if (binary_signal) {
+                signal_sems.push_back(binary_signal);
+                signal_values.push_back(0);
+            }
+            std::lock_guard lock(*q.mutex);
+            const uint64_t serial = q.serial.load() + 1;
+            signal_sems.push_back(q.timeline->semaphore);
+            signal_values.push_back(serial);
+            VkTimelineSemaphoreSubmitInfo ti{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+            ti.waitSemaphoreValueCount = static_cast<uint32_t>(wait_values.size());
+            ti.pWaitSemaphoreValues = wait_values.data();
+            ti.signalSemaphoreValueCount = static_cast<uint32_t>(signal_values.size());
+            ti.pSignalSemaphoreValues = signal_values.data();
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO, &ti};
+            si.waitSemaphoreCount = static_cast<uint32_t>(wait_sems.size());
+            si.pWaitSemaphores = wait_sems.data();
+            si.pWaitDstStageMask = wait_stages.data();
+            si.commandBufferCount = static_cast<uint32_t>(cmds.size());
+            si.pCommandBuffers = cmds.data();
+            si.signalSemaphoreCount = static_cast<uint32_t>(signal_sems.size());
+            si.pSignalSemaphores = signal_sems.data();
+            const VkResult r = fn_.vkQueueSubmit(q.queue, 1, &si, VK_NULL_HANDLE);
+            if (r == VK_SUCCESS)
+                q.serial.store(serial);
+            return r;
+        }
+
+        // emulated timelines: wait for the other work on the cpu first, outside the queue lock
+        for (const timeline_op& w : waits) {
+            if (timeline_value(*w.target) >= w.value)
+                continue;
+            if (!timeline_wait(*w.target, w.value, 10'000'000'000ull))
+                report_error("a fence wait never completed (value " + std::to_string(w.value) +
+                             "); submitting without it");
+        }
+        std::shared_ptr<pooled_fence> fence = acquire_fence();
+        VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        if (binary_wait) {
+            si.waitSemaphoreCount = 1;
+            si.pWaitSemaphores = &binary_wait;
+            si.pWaitDstStageMask = &stage;
+        }
+        si.commandBufferCount = static_cast<uint32_t>(cmds.size());
+        si.pCommandBuffers = cmds.data();
+        if (binary_signal) {
+            si.signalSemaphoreCount = 1;
+            si.pSignalSemaphores = &binary_signal;
         }
         std::lock_guard lock(*q.mutex);
         const uint64_t serial = q.serial.load() + 1;
-        signals[1] = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, nullptr, q.timeline, serial,
-                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,    0};
-        VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-        si.waitSemaphoreInfoCount = wait_count;
-        si.pWaitSemaphoreInfos = waits;
-        si.signalSemaphoreInfoCount = 2;
-        si.pSignalSemaphoreInfos = signals;
-        if (fn_.vkQueueSubmit2(q.queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS)
-            q.serial.store(serial);
+        const VkResult r = fn_.vkQueueSubmit(q.queue, 1, &si, fence->fence);
+        if (r != VK_SUCCESS)
+            return r;
+        q.serial.store(serial);
+        auto track = [&](timeline& t, uint64_t value) {
+            std::lock_guard tl(t.mutex);
+            t.submitted = (std::max)(t.submitted, value);
+            t.inflight.push_back({value, fence});
+            t.changed.notify_all();
+        };
+        track(*q.timeline, serial);
+        for (const timeline_op& s : signals)
+            track(*s.target, s.value);
+        return VK_SUCCESS;
+    }
+
+    std::shared_ptr<timeline> device::make_timeline(uint64_t initial) {
+        auto t = std::make_shared<timeline>();
+        t->done = t->submitted = initial;
+        if (timeline_native_) {
+            VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+            type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+            type.initialValue = initial;
+            VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+            if (fn_.vkCreateSemaphore(device_, &si, nullptr, &t->semaphore) != VK_SUCCESS)
+                return nullptr;
+        }
+        return t;
+    }
+
+    void device::release_timeline(std::shared_ptr<timeline>& t) {
+        if (!t)
+            return;
+        {
+            std::lock_guard lock(t->mutex);
+            t->inflight.clear();
+        }
+        if (t->semaphore) {
+            fn_.vkDestroySemaphore(device_, t->semaphore, nullptr);
+            t->semaphore = VK_NULL_HANDLE;
+        }
+        t.reset();
+    }
+
+    std::shared_ptr<pooled_fence> device::acquire_fence() {
+        VkFence fence = VK_NULL_HANDLE;
+        {
+            std::lock_guard lock(fence_pool_mutex_);
+            if (!free_fences_.empty()) {
+                fence = free_fences_.back();
+                free_fences_.pop_back();
+            }
+        }
+        if (!fence) {
+            VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            fn_.vkCreateFence(device_, &fi, nullptr, &fence);
+            std::lock_guard lock(fence_pool_mutex_);
+            all_fences_.push_back(fence);
+        }
+        return std::shared_ptr<pooled_fence>(new pooled_fence{fence}, [this](pooled_fence* p) {
+            if (p->fence) {
+                fn_.vkResetFences(device_, 1, &p->fence);
+                std::lock_guard lock(fence_pool_mutex_);
+                free_fences_.push_back(p->fence);
+            }
+            delete p;
+        });
+    }
+
+    // timeline.mutex held
+    void device::poll_timeline(timeline& t) {
+        for (auto it = t.inflight.begin(); it != t.inflight.end();) {
+            if (fn_.vkGetFenceStatus(device_, it->fence->fence) == VK_SUCCESS) {
+                t.done = (std::max)(t.done, it->value);
+                it = t.inflight.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    uint64_t device::timeline_value(timeline& t) {
+        if (t.semaphore) {
+            uint64_t value = 0;
+            fn_.vkGetSemaphoreCounterValue(device_, t.semaphore, &value);
+            return value;
+        }
+        std::lock_guard lock(t.mutex);
+        poll_timeline(t);
+        return t.done;
+    }
+
+    bool device::timeline_wait(timeline& t, uint64_t value, uint64_t timeout_ns) {
+        if (t.semaphore) {
+            VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            wi.semaphoreCount = 1;
+            wi.pSemaphores = &t.semaphore;
+            wi.pValues = &value;
+            return fn_.vkWaitSemaphores(device_, &wi, timeout_ns) == VK_SUCCESS;
+        }
+        using clock = std::chrono::steady_clock;
+        const auto start = clock::now();
+        auto expired = [&] {
+            if (timeout_ns == ~0ull)
+                return false;
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start)
+                                             .count()) >= timeout_ns;
+        };
+        for (;;) {
+            std::shared_ptr<pooled_fence> fence;
+            {
+                std::unique_lock lock(t.mutex);
+                poll_timeline(t);
+                if (t.done >= value)
+                    return true;
+                uint64_t best = ~0ull;
+                for (const timeline::pending& p : t.inflight)
+                    if (p.value >= value && p.value < best) {
+                        best = p.value;
+                        fence = p.fence;
+                    }
+                if (!fence) {
+                    // nothing submitted yet reaches the value: it can still come from another thread
+                    if (expired())
+                        return false;
+                    t.changed.wait_for(lock, std::chrono::milliseconds(2));
+                    continue;
+                }
+            }
+            const VkResult r = fn_.vkWaitForFences(device_, 1, &fence->fence, VK_TRUE, 20'000'000ull);
+            if (r != VK_SUCCESS && r != VK_TIMEOUT)
+                return false;
+            if (r == VK_TIMEOUT && expired())
+                return false;
+        }
+    }
+
+    void device::timeline_signal(timeline& t, uint64_t value) {
+        if (t.semaphore) {
+            VkSemaphoreSignalInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+            si.semaphore = t.semaphore;
+            si.value = value;
+            fn_.vkSignalSemaphore(device_, &si);
+            return;
+        }
+        std::lock_guard lock(t.mutex);
+        t.done = (std::max)(t.done, value);
+        t.submitted = (std::max)(t.submitted, value);
+        t.changed.notify_all();
+    }
+
+    void device::pipeline_barrier(VkCommandBuffer cmd, const VkDependencyInfo& info) {
+        if (sync2_) {
+            fn_.vkCmdPipelineBarrier2(cmd, &info);
+            return;
+        }
+        thread_local std::vector<VkMemoryBarrier> memory;
+        thread_local std::vector<VkBufferMemoryBarrier> buffers;
+        thread_local std::vector<VkImageMemoryBarrier> images;
+        memory.clear();
+        buffers.clear();
+        images.clear();
+        VkPipelineStageFlags src = 0, dst = 0;
+        for (uint32_t i = 0; i < info.memoryBarrierCount; i++) {
+            const VkMemoryBarrier2& b = info.pMemoryBarriers[i];
+            src |= legacy_stages(b.srcStageMask);
+            dst |= legacy_stages(b.dstStageMask);
+            memory.push_back({VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, legacy_access(b.srcAccessMask),
+                              legacy_access(b.dstAccessMask)});
+        }
+        for (uint32_t i = 0; i < info.bufferMemoryBarrierCount; i++) {
+            const VkBufferMemoryBarrier2& b = info.pBufferMemoryBarriers[i];
+            src |= legacy_stages(b.srcStageMask);
+            dst |= legacy_stages(b.dstStageMask);
+            buffers.push_back({VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr, legacy_access(b.srcAccessMask),
+                               legacy_access(b.dstAccessMask), b.srcQueueFamilyIndex, b.dstQueueFamilyIndex,
+                               b.buffer, b.offset, b.size});
+        }
+        for (uint32_t i = 0; i < info.imageMemoryBarrierCount; i++) {
+            const VkImageMemoryBarrier2& b = info.pImageMemoryBarriers[i];
+            src |= legacy_stages(b.srcStageMask);
+            dst |= legacy_stages(b.dstStageMask);
+            images.push_back({VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, legacy_access(b.srcAccessMask),
+                              legacy_access(b.dstAccessMask), b.oldLayout, b.newLayout, b.srcQueueFamilyIndex,
+                              b.dstQueueFamilyIndex, b.image, b.subresourceRange});
+        }
+        if (!src)
+            src = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        if (!dst)
+            dst = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        fn_.vkCmdPipelineBarrier(cmd, src, dst, 0,
+                                 static_cast<uint32_t>(memory.size()), memory.data(),
+                                 static_cast<uint32_t>(buffers.size()), buffers.data(),
+                                 static_cast<uint32_t>(images.size()), images.data());
+    }
+
+    void device::write_timestamp(VkCommandBuffer cmd, VkQueryPool pool, uint32_t index) {
+        if (sync2_)
+            fn_.vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pool, index);
         else
-            report_error("present submit failed");
+            fn_.vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, index);
+    }
+
+    // render passes for drivers without dynamic rendering. One pass per distinct set of formats and load/store
+    // operations, created on first use. Pipelines are built against the same cache with neutral operations, which
+    // is compatible with any pass that shares the formats and sample count
+    VkRenderPass device::render_pass(const render_pass_key& key) {
+        std::lock_guard lock(render_pass_mutex_);
+        for (auto& [k, pass] : render_passes_)
+            if (k == key)
+                return pass;
+
+        VkAttachmentDescription attachments[max_color_targets * 2 + 1]{};
+        VkAttachmentReference color_refs[max_color_targets]{};
+        VkAttachmentReference resolve_refs[max_color_targets]{};
+        VkAttachmentReference depth_ref{};
+        uint32_t count = 0;
+        bool any_resolve = false;
+        const VkSampleCountFlagBits samples = samples_of(key.samples);
+        for (uint32_t i = 0; i < key.color_count; i++) {
+            VkAttachmentDescription& a = attachments[count];
+            a.format = key.color_format[i];
+            a.samples = samples;
+            a.loadOp = static_cast<VkAttachmentLoadOp>(key.color_load[i]);
+            a.storeOp = static_cast<VkAttachmentStoreOp>(key.color_store[i]);
+            a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            a.initialLayout = a.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            color_refs[i] = {count++, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        }
+        for (uint32_t i = 0; i < key.color_count; i++) {
+            if (!key.color_resolve[i]) {
+                resolve_refs[i] = {VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_UNDEFINED};
+                continue;
+            }
+            any_resolve = true;
+            VkAttachmentDescription& a = attachments[count];
+            a.format = key.color_format[i];
+            a.samples = VK_SAMPLE_COUNT_1_BIT;
+            a.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            a.initialLayout = a.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            resolve_refs[i] = {count++, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        }
+        const bool have_depth = key.depth_format != VK_FORMAT_UNDEFINED;
+        if (have_depth) {
+            const VkImageLayout layout = key.depth_read_only ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                             : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            VkAttachmentDescription& a = attachments[count];
+            a.format = key.depth_format;
+            a.samples = samples;
+            a.loadOp = static_cast<VkAttachmentLoadOp>(key.depth_load);
+            a.storeOp = static_cast<VkAttachmentStoreOp>(key.depth_store);
+            a.stencilLoadOp = key.depth_stencil ? a.loadOp : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            a.stencilStoreOp = key.depth_stencil ? a.storeOp : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            a.initialLayout = a.finalLayout = layout;
+            depth_ref = {count++, layout};
+        }
+
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = key.color_count;
+        sub.pColorAttachments = color_refs;
+        sub.pResolveAttachments = any_resolve ? resolve_refs : nullptr;
+        sub.pDepthStencilAttachment = have_depth ? &depth_ref : nullptr;
+
+        VkRenderPassCreateInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        ci.attachmentCount = count;
+        ci.pAttachments = attachments;
+        ci.subpassCount = 1;
+        ci.pSubpasses = &sub;
+        VkRenderPass pass = VK_NULL_HANDLE;
+        if (fn_.vkCreateRenderPass(device_, &ci, nullptr, &pass) != VK_SUCCESS) {
+            report_error("vkCreateRenderPass failed");
+            return VK_NULL_HANDLE;
+        }
+        render_passes_.emplace_back(key, pass);
+        return pass;
+    }
+
+    // framebuffers live for the frame slot that recorded them
+    VkFramebuffer device::make_framebuffer(VkRenderPass pass, const VkImageView* views, uint32_t count, uint32_t width,
+                                           uint32_t height) {
+        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fi.renderPass = pass;
+        fi.attachmentCount = count;
+        fi.pAttachments = views;
+        fi.width = width;
+        fi.height = height;
+        fi.layers = 1;
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        if (fn_.vkCreateFramebuffer(device_, &fi, nullptr, &fb) != VK_SUCCESS) {
+            report_error("vkCreateFramebuffer failed");
+            return VK_NULL_HANDLE;
+        }
+        std::lock_guard lock(framebuffer_mutex_);
+        slot_framebuffers_[slot_].push_back(fb);
+        return fb;
     }
 
     std::unique_ptr<conduit::swapchain> device::create_swapchain(const swapchain_desc& desc) {
@@ -1620,6 +2098,12 @@ namespace conduit::vk {
                         fn_.vkResetCommandPool(device_, per.pool, 0);
                     per.used = 0;
                 }
+        }
+        {
+            std::lock_guard lock(framebuffer_mutex_);
+            for (VkFramebuffer f : slot_framebuffers_[s])
+                fn_.vkDestroyFramebuffer(device_, f, nullptr);
+            slot_framebuffers_[s].clear();
         }
         std::lock_guard lock(descriptor_mutex_);
         frame_descriptors& fd = frame_descriptors_[s];
@@ -1638,26 +2122,15 @@ namespace conduit::vk {
         slot_ = static_cast<uint32_t>(frame_ % options_.frames_in_flight);
 
         const queue_serials& need = slot_serials_[slot_];
-        VkSemaphore sems[queue_count];
-        uint64_t values[queue_count];
-        uint32_t n = 0;
-        for (size_t i = 0; i < queue_count; i++)
-            if (need[i]) {
-                sems[n] = queues_[i].timeline;
-                values[n] = need[i];
-                n++;
-            }
-        if (n) {
-            VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-            wi.semaphoreCount = n;
-            wi.pSemaphores = sems;
-            wi.pValues = values;
-            // no timeout: reusing a slot early would corrupt a slow frame still in flight until it finishes or the device is lost
-            VkResult r = fn_.vkWaitSemaphores(device_, &wi, 10'000'000'000ull);
-            while (r == VK_TIMEOUT)
-                r = fn_.vkWaitSemaphores(device_, &wi, 10'000'000'000ull);
-            if (r != VK_SUCCESS)
-                report_error("frame wait did not complete (" + std::to_string(r) + ")");
+        for (size_t i = 0; i < queue_count; i++) {
+            if (!need[i])
+                continue;
+            // reusing a slot early would corrupt a slow frame still in flight, so keep waiting for a long time
+            bool ok = false;
+            for (int attempt = 0; attempt < 12 && !ok; attempt++)
+                ok = timeline_wait(*queues_[i].timeline, need[i], 10'000'000'000ull);
+            if (!ok)
+                report_error("frame wait did not complete");
         }
         reset_slot(slot_);
         retire_.collect(completed());

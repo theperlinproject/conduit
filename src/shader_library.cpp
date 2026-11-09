@@ -158,6 +158,9 @@ namespace conduit {
             return shader_target::msl;
         case conduit::api::webgpu:
             return shader_target::wgsl;
+        // OpenGL ES translates the SPIR-V itself when it builds a pipeline
+        case conduit::api::gles:
+            return shader_target::spirv;
         default:
             return shader_target::spirv;
         }
