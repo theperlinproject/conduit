@@ -117,6 +117,18 @@ exit with code 77 (skipped) on machines without a driver.
 
 ## Performance
 
+- GPU-driven rendering by default where the hardware has it: `device_features::gpu_driven` is set when multi draw
+  indirect and a GPU-side draw count are both available (Vulkan with `drawIndirectCount`, Direct3D 12, null), and
+  `render_profile::gpu_culling` follows it. `draw_indexed_indirect_count` without driver support runs every slot
+  instead of failing, like the backends that never had it: the culling pass zeroes unused slots.
+- Pipelines compile off the render thread on Vulkan and Direct3D 12 with `device_options::async_pipelines` (it already
+  did on Metal).
+  The first bind waits up to 4 ms, after that draws with a pipeline still compiling are skipped instead of stalling
+  the frame. `CONDUIT_SYNC_PIPELINES=1` turns it off. `device_stats::pipelines_pending` counts the ones in flight.
+- Work graphs on Direct3D 12: `device_features::work_graphs` (tier 1.0, shader model 6.8),
+  `device::create_work_graph` from a `lib_6_8` DXIL library with a pipeline layout as its global root signature,
+  bound with `set_pipeline` and run with `command_list::dispatch_graph`. Elsewhere `create_work_graph` returns null.
+
 - Draw, bind and barrier recording does not allocate once warmed up: command lists, barrier scratch and descriptor pools are pooled and reused.
 - Redundant `set_pipeline`, `set_bind_group` and `set_vertex_buffer` calls are dropped, and dirty bind groups are bound in contiguous runs.
 - Statistics are counted per command list and folded in once at submit, so recording on several threads shares no cache lines.

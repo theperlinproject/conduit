@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 
@@ -28,6 +29,14 @@ namespace conduit::vk {
     }
 
     device::~device() {
+        {
+            std::lock_guard lock(compile_mutex_);
+            compile_stop_ = true;
+        }
+        compile_wake_.notify_all();
+        for (std::thread& t : compile_threads_)
+            t.join();
+        compile_threads_.clear();
         if (!device_)
             return;
         fn_.vkDeviceWaitIdle(device_);
@@ -48,8 +57,9 @@ namespace conduit::vk {
         pipeline_layouts_.for_each([&](pipeline_layout_handle, pipeline_layout_rec& r) {
             fn_.vkDestroyPipelineLayout(device_, r.layout, nullptr);
         });
-        pipelines_.for_each(
-            [&](pipeline_handle, pipeline_rec& r) { fn_.vkDestroyPipeline(device_, r.pipeline, nullptr); });
+        pipelines_.for_each([&](pipeline_handle, pipeline_rec& r) {
+            fn_.vkDestroyPipeline(device_, r.build ? r.build->pipeline : r.pipeline, nullptr);
+        });
         queries_.for_each([&](query_set_handle, query_rec& r) { fn_.vkDestroyQueryPool(device_, r.pool, nullptr); });
         fences_.for_each([&](fence_handle, fence_rec& r) { release_timeline(r.timeline); });
 
@@ -457,6 +467,13 @@ namespace conduit::vk {
             fn_.vkCreatePipelineCache(device_, &pc, nullptr, &pipeline_cache_);
         }
 
+        if (options_.async_pipelines && !std::getenv("CONDUIT_SYNC_PIPELINES")) {
+            const uint32_t cores = std::max(1u, std::thread::hardware_concurrency());
+            const uint32_t workers = std::clamp(cores / 2, 1u, 4u);
+            for (uint32_t i = 0; i < workers; i++)
+                compile_threads_.emplace_back([this] { compile_worker(); });
+        }
+
         VkDescriptorSetLayoutCreateInfo empty{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         fn_.vkCreateDescriptorSetLayout(device_, &empty, nullptr, &empty_set_layout_);
 
@@ -483,6 +500,8 @@ namespace conduit::vk {
         caps_.features.dedicated_copy_queue =
             queues_[2].queue != queues_[0].queue && queues_[2].queue != queues_[1].queue;
         caps_.features.mesh_shaders = phys_.has("VK_EXT_mesh_shader");
+        caps_.features.work_graphs = phys_.has("VK_AMDX_shader_enqueue");
+        caps_.features.gpu_driven = caps_.features.multi_draw_indirect && caps_.features.draw_indirect_count;
         caps_.features.ray_tracing = phys_.has("VK_KHR_ray_query") && phys_.has("VK_KHR_acceleration_structure");
         caps_.features.variable_rate_shading = phys_.has("VK_KHR_fragment_shading_rate");
         caps_.features.cooperative_vector = phys_.has("VK_NV_cooperative_vector");
@@ -1209,6 +1228,95 @@ namespace conduit::vk {
         return pipeline_layouts_.alloc(rec);
     }
 
+    struct device::pipeline_job {
+        std::string name, vs_entry, fs_entry;
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        VkVertexInputBindingDescription bindings[max_vertex_streams]{};
+        VkVertexInputAttributeDescription attrs[max_vertex_attributes]{};
+        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        VkPipelineRasterizationDepthClipStateCreateInfoEXT clip{
+            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT};
+        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        VkPipelineColorBlendAttachmentState blend_states[max_color_targets]{};
+        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        VkFormat color_formats[max_color_targets]{};
+        VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        std::shared_ptr<pipeline_build> build;
+    };
+
+    bool pipeline_build::wait_for(uint64_t timeout_ns) {
+        std::unique_lock lock(mutex);
+        return done.wait_for(lock, std::chrono::nanoseconds(timeout_ns), [&] { return state.load() != 0; });
+    }
+
+    void device::run_pipeline_job(pipeline_job& job) {
+        pipeline_build& b = *job.build;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        const VkResult r = fn_.vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &job.pi, nullptr, &pipeline);
+        {
+            std::lock_guard lock(b.mutex);
+            if (r == VK_SUCCESS) {
+                name_object(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<uint64_t>(pipeline), job.name.c_str());
+                b.pipeline = pipeline;
+                b.state.store(1, std::memory_order_release);
+            } else {
+                b.error = "vkCreateGraphicsPipelines failed for '" + job.name + "' (" + std::to_string(r) + ")";
+                b.state.store(-1, std::memory_order_release);
+            }
+        }
+        b.done.notify_all();
+    }
+
+    void device::compile_worker() {
+        for (;;) {
+            std::shared_ptr<pipeline_job> job;
+            {
+                std::unique_lock lock(compile_mutex_);
+                compile_wake_.wait(lock, [&] { return compile_stop_ || !compile_queue_.empty(); });
+                if (compile_queue_.empty())
+                    return;
+                job = std::move(compile_queue_.front());
+                compile_queue_.pop_front();
+                compile_running_++;
+            }
+            run_pipeline_job(*job);
+            pipelines_pending_--;
+            {
+                std::lock_guard lock(compile_mutex_);
+                compile_running_--;
+            }
+            compile_idle_.notify_all();
+        }
+    }
+
+    void device::drain_pipeline_jobs() {
+        std::unique_lock lock(compile_mutex_);
+        compile_idle_.wait(lock, [&] { return compile_queue_.empty() && compile_running_ == 0; });
+    }
+
+    VkPipeline device::ready_pipeline(const pipeline_rec& p) {
+        if (!p.build)
+            return p.pipeline;
+        pipeline_build& b = *p.build;
+        int state = b.state.load(std::memory_order_acquire);
+        // first bind: most pipelines finish within a few ms, worth a short wait so nothing blinks
+        if (state == 0 && !b.waited.exchange(true)) {
+            b.wait_for(4'000'000ull);
+            state = b.state.load(std::memory_order_acquire);
+        }
+        if (state == 1)
+            return b.pipeline;
+        if (state < 0 && !b.reported.exchange(true))
+            report_error(b.error);
+        return VK_NULL_HANDLE;
+    }
+
     pipeline_handle device::create_graphics_pipeline(const graphics_pipeline_desc& desc) {
         pipeline_layout_rec* layout = pipeline_layouts_.get(desc.layout);
         shader_rec* vs = shaders_.get(desc.vertex);
@@ -1217,14 +1325,18 @@ namespace conduit::vk {
             report_error("CreateGraphicsPipeline: missing layout or vertex shader");
             return {};
         }
-        VkPipelineShaderStageCreateInfo stages[2]{};
+        auto job = std::make_shared<pipeline_job>();
+        job->name = desc.name ? desc.name : "";
+        job->vs_entry = vs->entry;
+        job->fs_entry = fs ? fs->entry : std::string();
+        auto& stages = job->stages;
         uint32_t stage_count = 0;
         stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                  nullptr,
                                  0,
                                  VK_SHADER_STAGE_VERTEX_BIT,
                                  vs->module,
-                                 vs->entry.c_str(),
+                                 job->vs_entry.c_str(),
                                  nullptr};
         if (fs)
             stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -1232,25 +1344,25 @@ namespace conduit::vk {
                                      0,
                                      VK_SHADER_STAGE_FRAGMENT_BIT,
                                      fs->module,
-                                     fs->entry.c_str(),
+                                     job->fs_entry.c_str(),
                                      nullptr};
 
-        VkVertexInputBindingDescription bindings[max_vertex_streams];
+        auto& bindings = job->bindings;
         for (uint32_t i = 0; i < desc.stream_count; i++)
             bindings[i] = {i, desc.streams[i].stride,
                            desc.streams[i].step == vertex_step::instance ? VK_VERTEX_INPUT_RATE_INSTANCE
                                                                          : VK_VERTEX_INPUT_RATE_VERTEX};
-        VkVertexInputAttributeDescription attrs[max_vertex_attributes];
+        auto& attrs = job->attrs;
         for (uint32_t i = 0; i < desc.attribute_count; i++)
             attrs[i] = {desc.attributes[i].location, desc.attributes[i].stream, base_format(desc.attributes[i].format),
                         desc.attributes[i].offset};
-        VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        auto& vi = job->vi;
         vi.vertexBindingDescriptionCount = desc.stream_count;
         vi.pVertexBindingDescriptions = bindings;
         vi.vertexAttributeDescriptionCount = desc.attribute_count;
         vi.pVertexAttributeDescriptions = attrs;
 
-        VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        auto& ia = job->ia;
         switch (desc.topology) {
         case topology::triangle_list:
             ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -1266,12 +1378,11 @@ namespace conduit::vk {
             break;
         }
 
-        VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        auto& vp = job->vp;
         vp.viewportCount = vp.scissorCount = 1;
 
-        VkPipelineRasterizationDepthClipStateCreateInfoEXT clip{
-            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT};
-        VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        auto& clip = job->clip;
+        auto& rs = job->rs;
         rs.polygonMode = desc.raster.wireframe ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
         rs.cullMode = desc.raster.cull == cull_mode::none   ? VK_CULL_MODE_NONE
                       : desc.raster.cull == cull_mode::back ? VK_CULL_MODE_BACK_BIT
@@ -1292,11 +1403,11 @@ namespace conduit::vk {
             }
         }
 
-        VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        auto& ms = job->ms;
         ms.rasterizationSamples = samples_of(desc.samples);
         ms.alphaToCoverageEnable = desc.blend.alpha_to_coverage;
 
-        VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        auto& ds = job->ds;
         ds.depthTestEnable = desc.depth_stencil.depth_test;
         ds.depthWriteEnable = desc.depth_stencil.depth_write;
         ds.depthCompareOp = to_vk(desc.depth_stencil.depth_compare);
@@ -1314,7 +1425,7 @@ namespace conduit::vk {
         ds.front = face(desc.depth_stencil.front);
         ds.back = face(desc.depth_stencil.back);
 
-        VkPipelineColorBlendAttachmentState blend_states[max_color_targets];
+        auto& blend_states = job->blend_states;
         for (uint32_t i = 0; i < desc.color_count; i++) {
             const blend_target& t = desc.blend.targets[i];
             VkPipelineColorBlendAttachmentState& s = blend_states[i];
@@ -1331,20 +1442,20 @@ namespace conduit::vk {
                                (has(t.write_mask, color_mask::b) ? VK_COLOR_COMPONENT_B_BIT : 0) |
                                (has(t.write_mask, color_mask::a) ? VK_COLOR_COMPONENT_A_BIT : 0);
         }
-        VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        auto& cb = job->cb;
         cb.attachmentCount = desc.color_count;
         cb.pAttachments = blend_states;
 
-        const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                                 VK_DYNAMIC_STATE_STENCIL_REFERENCE};
-        VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        static constexpr VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                                            VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+        auto& dyn = job->dyn;
         dyn.dynamicStateCount = static_cast<uint32_t>(std::size(dynamic_states));
         dyn.pDynamicStates = dynamic_states;
 
-        VkFormat color_formats[max_color_targets];
+        auto& color_formats = job->color_formats;
         for (uint32_t i = 0; i < desc.color_count; i++)
             color_formats[i] = format_to_vk(desc.color_formats[i]);
-        VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        auto& ri = job->ri;
         render_pass_key pass_key;
         ri.colorAttachmentCount = desc.color_count;
         ri.pColorAttachmentFormats = color_formats;
@@ -1354,7 +1465,7 @@ namespace conduit::vk {
                 ri.stencilAttachmentFormat = ri.depthAttachmentFormat;
         }
 
-        VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        auto& pi = job->pi;
         if (dynamic_rendering_) {
             pi.pNext = &ri;
         } else {
@@ -1384,11 +1495,6 @@ namespace conduit::vk {
         pi.layout = layout->layout;
 
         pipeline_rec rec;
-        if (fn_.vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &pi, nullptr, &rec.pipeline) != VK_SUCCESS) {
-            report_error("vkCreateGraphicsPipelines failed for '" + std::string(desc.name ? desc.name : "") + "'");
-            return {};
-        }
-        name_object(VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<uint64_t>(rec.pipeline), desc.name);
         rec.bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
         rec.layout_handle = desc.layout;
         rec.layout = layout->layout;
@@ -1398,6 +1504,23 @@ namespace conduit::vk {
         rec.color_formats = desc.color_formats;
         rec.depth_format = desc.depth_format;
         rec.stream_count = desc.stream_count;
+        job->build = std::make_shared<pipeline_build>();
+        if (!compile_threads_.empty()) {
+            rec.build = job->build;
+            pipelines_pending_++;
+            {
+                std::lock_guard lock(compile_mutex_);
+                compile_queue_.push_back(job);
+            }
+            compile_wake_.notify_one();
+        } else {
+            run_pipeline_job(*job);
+            if (job->build->state.load() != 1) {
+                report_error(job->build->error);
+                return {};
+            }
+            rec.pipeline = job->build->pipeline;
+        }
         live_pipelines_++;
         return pipelines_.alloc(rec);
     }
@@ -1481,6 +1604,8 @@ namespace conduit::vk {
         shader_rec rec;
         if (!shaders_.free(h, &rec))
             return;
+        if (!compile_threads_.empty())
+            drain_pipeline_jobs();
         retire([this, m = rec.module] { fn_.vkDestroyShaderModule(device_, m, nullptr); });
     }
 
@@ -1508,6 +1633,9 @@ namespace conduit::vk {
         pipeline_layout_rec rec;
         if (!pipeline_layouts_.free(h, &rec))
             return;
+        // a pipeline still compiling may reference the layout
+        if (!compile_threads_.empty())
+            drain_pipeline_jobs();
         retire([this, l = rec.layout] { fn_.vkDestroyPipelineLayout(device_, l, nullptr); });
     }
 
@@ -1516,7 +1644,14 @@ namespace conduit::vk {
         if (!pipelines_.free(h, &rec))
             return;
         live_pipelines_--;
-        retire([this, p = rec.pipeline] { fn_.vkDestroyPipeline(device_, p, nullptr); });
+        retire([this, p = rec.pipeline, build = rec.build] {
+            if (build) {
+                build->wait_for(~0ull >> 2);
+                fn_.vkDestroyPipeline(device_, build->pipeline, nullptr);
+            } else {
+                fn_.vkDestroyPipeline(device_, p, nullptr);
+            }
+        });
     }
 
     void device::destroy(query_set_handle h) {
@@ -2169,6 +2304,7 @@ namespace conduit::vk {
         s.live_textures = static_cast<uint32_t>(live_textures_.load());
         s.live_pipelines = static_cast<uint32_t>(live_pipelines_.load());
         s.live_bind_groups = static_cast<uint32_t>(live_groups_.load());
+        s.pipelines_pending = std::max(s.pipelines_pending, pipelines_pending_.load());
         return s;
     }
 

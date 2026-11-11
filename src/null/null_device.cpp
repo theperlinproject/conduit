@@ -144,6 +144,7 @@ namespace conduit {
                 caps_.adapter.vendor_id = 0;
                 device_features& f = caps_.features;
                 f.multi_draw_indirect = f.draw_indirect_count = f.draw_indirect_first_instance = true;
+                f.gpu_driven = true;
                 f.async_compute = f.dedicated_copy_queue = f.timestamp_queries = true;
                 f.sampler_anisotropy = true;
                 f.texture_compression_bc = true;

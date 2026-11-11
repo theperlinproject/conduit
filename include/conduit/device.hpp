@@ -82,6 +82,11 @@ namespace conduit {
         bool conservative_raster = false;
         bool depth_clip_control = false;
         bool buffer_device_address = false;
+        // d3d12 work graphs tier 1.0 (shader model 6.8) or VK_AMDX_shader_enqueue; detection only, no api yet
+        bool work_graphs = false;
+        // everything gpu-driven rendering needs: compute writes indirect arguments and a gpu-side count
+        // chooses how many run (multi draw indirect + draw indirect count + storage buffers in compute)
+        bool gpu_driven = false;
     };
 
     struct device_limits {
@@ -135,6 +140,13 @@ namespace conduit {
         bool allow_async_compute = true;
         bool async_pipelines = false;
         vendor_hooks hooks;
+    };
+
+    struct work_graph_desc {
+        std::span<const uint8_t> library;
+        const char* program = "graph";
+        pipeline_layout_handle layout;
+        const char* name = nullptr;
     };
 
     class swapchain {
@@ -203,6 +215,13 @@ namespace conduit {
                                                  uint64_t count_offset, uint32_t max_draws, uint32_t stride) = 0;
 
         virtual void dispatch(uint32_t x, uint32_t y, uint32_t z) = 0;
+        // runs the work graph bound with set_pipeline from its entry node 0, fed with records from cpu memory
+        // (copied at record time). only where caps().features.work_graphs and create_work_graph succeeded
+        virtual void dispatch_graph(const void* records, uint32_t count, uint32_t stride) {
+            (void)records;
+            (void)count;
+            (void)stride;
+        }
         virtual void dispatch_indirect(buffer_handle args, uint64_t offset) = 0;
 
         virtual void write_timestamp(query_set_handle set, uint32_t index) = 0;
@@ -258,6 +277,12 @@ namespace conduit {
         virtual pipeline_layout_handle create_pipeline_layout(const pipeline_layout_desc& desc) = 0;
         virtual pipeline_handle create_graphics_pipeline(const graphics_pipeline_desc& desc) = 0;
         virtual pipeline_handle create_compute_pipeline(const compute_pipeline_desc& desc) = 0;
+        // a work graph from a DXIL library (lib_6_8) whose global root signature is the given layout: bound like a
+        // compute pipeline, run with command_list::dispatch_graph. null where work graphs are not supported
+        virtual pipeline_handle create_work_graph(const work_graph_desc& desc) {
+            (void)desc;
+            return {};
+        }
         virtual query_set_handle create_query_set(const query_set_desc& desc) = 0;
 
         // destruction is deferred until every queue has finished the work submitted so far

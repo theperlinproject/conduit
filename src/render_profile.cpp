@@ -337,7 +337,7 @@ namespace conduit {
         p.msaa = 1;
 
         p.frames_in_flight = (p.tier >= tier::medium && best.adapter.type == adapter_type::discrete) ? 3 : 2;
-        p.gpu_culling = !have_caps ? p.tier >= tier::medium : (f.draw_indirect_count || f.multi_draw_indirect);
+        p.gpu_culling = !have_caps ? p.tier >= tier::medium : (f.gpu_driven || (f.multi_draw_indirect && f.draw_indirect_count));
         p.async_compute = have_caps && f.async_compute && best.adapter.type == adapter_type::discrete;
         p.tearing = have_caps && f.tearing;
         p.hdr = user.allow_hdr && have_caps && f.hdr_output;

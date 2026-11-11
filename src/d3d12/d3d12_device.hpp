@@ -26,6 +26,8 @@
 #include "D3D12MemAlloc.h"
 
 #include <array>
+#include <condition_variable>
+#include <deque>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -177,8 +179,21 @@ namespace conduit::d3d12 {
         std::array<std::array<int, max_dynamic_offsets>, max_bind_groups> dynamic_param{};
     };
 
+    // a graphics pso built on the device's compile threads: the first bind waits a few ms, after that draws with
+    // it are skipped until it is ready, so a new material shows a frame late instead of hitching the frame
+    struct pipeline_build {
+        std::atomic<int> state{0};
+        winrt::com_ptr<ID3D12PipelineState> pso;
+        std::string error;
+        std::atomic<bool> waited{false}, reported{false};
+        std::mutex mutex;
+        std::condition_variable done;
+        bool wait_for(uint64_t timeout_ns);
+    };
+
     struct pipeline_rec {
         winrt::com_ptr<ID3D12PipelineState> pso;
+        std::shared_ptr<pipeline_build> build;
         winrt::com_ptr<ID3D12RootSignature> root_signature;
         pipeline_layout_handle layout_handle;
         bool compute = false;
@@ -189,6 +204,12 @@ namespace conduit::d3d12 {
         std::array<format, max_color_targets> color_formats{};
         format depth_format = format::unknown;
         uint32_t push_bytes = 0;
+        // work graphs: no pso, a state object with its program and backing memory instead
+        winrt::com_ptr<ID3D12StateObject> graph;
+        D3D12_PROGRAM_IDENTIFIER program{};
+        winrt::com_ptr<ID3D12Resource> backing;
+        D3D12_GPU_VIRTUAL_ADDRESS_RANGE backing_range{};
+        std::shared_ptr<std::atomic<bool>> backing_ready;
     };
 
     struct query_rec {
@@ -251,6 +272,7 @@ namespace conduit::d3d12 {
         void draw_indexed_indirect_count(buffer_handle args, uint64_t offset, buffer_handle count_buffer,
                                          uint64_t count_offset, uint32_t max_draws, uint32_t stride) override;
         void dispatch(uint32_t x, uint32_t y, uint32_t z) override;
+        void dispatch_graph(const void* records, uint32_t count, uint32_t stride) override;
         void dispatch_indirect(buffer_handle args, uint64_t offset) override;
         void write_timestamp(query_set_handle set, uint32_t index) override;
         void resolve_queries(query_set_handle set, uint32_t first, uint32_t count, buffer_handle dst,
@@ -281,6 +303,7 @@ namespace conduit::d3d12 {
         pipeline_rec pipeline_;
         pipeline_layout_handle layout_handle_;
         bool have_pipeline_ = false;
+        bool pipeline_pending_ = false;
         bool in_rendering_ = false;
         bool pass_broken_ = false;
         std::array<bind_group_handle, max_bind_groups> groups_{};
@@ -346,6 +369,7 @@ namespace conduit::d3d12 {
         pipeline_layout_handle create_pipeline_layout(const pipeline_layout_desc& desc) override;
         pipeline_handle create_graphics_pipeline(const graphics_pipeline_desc& desc) override;
         pipeline_handle create_compute_pipeline(const compute_pipeline_desc& desc) override;
+        pipeline_handle create_work_graph(const work_graph_desc& desc) override;
         query_set_handle create_query_set(const query_set_desc& desc) override;
 
         void destroy(buffer_handle h) override;
@@ -384,6 +408,7 @@ namespace conduit::d3d12 {
 
         memory_budget query_memory_budget() override;
         device_stats stats() const override;
+        winrt::com_ptr<ID3D12PipelineState> ready_pipeline(const pipeline_rec& p);
         std::vector<uint8_t> serialize_pipeline_cache() override;
         std::string debug_report() override;
         float timestamp_period_ns() const override { return caps_.limits.timestamp_period_ns; }
@@ -453,6 +478,20 @@ namespace conduit::d3d12 {
 
         winrt::com_ptr<ID3D12PipelineLibrary> pipeline_library_;
         std::mutex library_mutex_;
+
+        struct pipeline_job;
+        void run_pipeline_job(pipeline_job& job);
+        void compile_worker();
+        void start_compile_threads();
+        void stop_compile_threads();
+        void drain_pipeline_jobs();
+        std::mutex compile_mutex_;
+        std::condition_variable compile_wake_, compile_idle_;
+        std::deque<std::shared_ptr<pipeline_job>> compile_queue_;
+        std::vector<std::thread> compile_threads_;
+        uint32_t compile_running_ = 0;
+        bool compile_stop_ = false;
+        std::atomic<uint64_t> pipelines_pending_{0};
 
         std::mutex pools_mutex_;
         std::unordered_map<std::thread::id, std::unique_ptr<thread_pools>> thread_pools_;

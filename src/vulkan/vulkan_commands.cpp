@@ -14,6 +14,7 @@ namespace conduit::vk {
         pipeline_ = {};
         pipeline_handle_ = {};
         have_pipeline_ = false;
+        pipeline_pending_ = false;
         in_rendering_ = false;
         groups_ = {};
         dynamic_offsets_ = {};
@@ -502,6 +503,15 @@ namespace conduit::vk {
                             : "graphics pipeline set outside a rendering pass");
         if (have_pipeline_ && !invalid_ && pipeline_handle_ == handle)
             return;
+        const VkPipeline native = device_.ready_pipeline(*p);
+        if (!native) {
+            // still compiling (or failed): drop draws until the next pipeline instead of stalling the frame
+            have_pipeline_ = false;
+            pipeline_pending_ = true;
+            pipeline_handle_ = {};
+            return;
+        }
+        pipeline_pending_ = false;
         if (!have_pipeline_ || pipeline_.layout != p->layout) {
             for (uint32_t i = 0; i < max_bind_groups; i++)
                 if (groups_[i])
@@ -509,9 +519,11 @@ namespace conduit::vk {
             push_dirty_ = push_used_ != 0;
         }
         pipeline_ = *p;
+        pipeline_.pipeline = native;
+        pipeline_.build.reset();
         pipeline_handle_ = handle;
         have_pipeline_ = true;
-        device_.fn_.vkCmdBindPipeline(cmd_, p->bind_point, p->pipeline);
+        device_.fn_.vkCmdBindPipeline(cmd_, p->bind_point, native);
         counters_.pipeline_binds++;
     }
 
@@ -664,6 +676,8 @@ namespace conduit::vk {
 
     void cmd_list::draw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
                         uint32_t first_instance) {
+        if (pipeline_pending_)
+            return;
         if (!have_pipeline_ || !in_rendering_) {
             fail("Draw without a pipeline or outside a rendering pass");
             return;
@@ -675,6 +689,8 @@ namespace conduit::vk {
 
     void cmd_list::draw_indexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index,
                                 int32_t vertex_offset, uint32_t first_instance) {
+        if (pipeline_pending_)
+            return;
         if (!have_pipeline_ || !in_rendering_ || !have_index_) {
             fail("DrawIndexed without a pipeline, index buffer or rendering pass");
             return;
@@ -685,6 +701,8 @@ namespace conduit::vk {
     }
 
     void cmd_list::draw_indexed_indirect(buffer_handle args, uint64_t offset, uint32_t max_draws, uint32_t stride) {
+        if (pipeline_pending_)
+            return;
         buffer_rec* a = device_.buffers_.get(args);
         if (!a || !have_pipeline_ || !in_rendering_ || !have_index_) {
             fail("DrawIndexedIndirect: missing buffer, pipeline, index buffer or rendering pass");
@@ -706,6 +724,8 @@ namespace conduit::vk {
 
     void cmd_list::draw_indexed_indirect_count(buffer_handle args, uint64_t offset, buffer_handle count_buffer,
                                                uint64_t count_offset, uint32_t max_draws, uint32_t stride) {
+        if (pipeline_pending_)
+            return;
         buffer_rec* a = device_.buffers_.get(args);
         buffer_rec* c = device_.buffers_.get(count_buffer);
         if (!a || !c || !have_pipeline_ || !in_rendering_ || !have_index_) {
@@ -713,7 +733,8 @@ namespace conduit::vk {
             return;
         }
         if (!device_.fn_.vkCmdDrawIndexedIndirectCount) {
-            fail("DrawIndexedIndirectCount needs the drawIndirectCount feature");
+            // no count support: run every slot, as the other backends do; the culling pass zeroes the unused ones
+            draw_indexed_indirect(args, offset, max_draws, stride);
             return;
         }
         if (device_.use_validator_) {

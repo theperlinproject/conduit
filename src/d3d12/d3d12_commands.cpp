@@ -77,6 +77,7 @@ namespace conduit::d3d12 {
         pipeline_ = {};
         layout_handle_ = {};
         have_pipeline_ = false;
+        pipeline_pending_ = false;
         in_rendering_ = false;
         groups_ = {};
         dynamic_offsets_ = {};
@@ -507,12 +508,23 @@ namespace conduit::d3d12 {
         if (p->compute == in_rendering_)
             fail(p->compute ? "compute pipeline set inside a rendering pass"
                             : "graphics pipeline set outside a rendering pass");
-        if (have_pipeline_ && !invalid_ && pipeline_.pso.get() == p->pso.get())
+        const winrt::com_ptr<ID3D12PipelineState> pso = device_.ready_pipeline(*p);
+        if (!pso && !p->graph) {
+            // still compiling (or failed): skip draws until the next pipeline rather than stall the frame
+            have_pipeline_ = false;
+            pipeline_pending_ = true;
+            return;
+        }
+        pipeline_pending_ = false;
+        if (have_pipeline_ && !invalid_ && pipeline_.pso.get() == pso.get() && pipeline_.graph.get() == p->graph.get())
             return;
         pipeline_ = *p;
+        pipeline_.pso = pso;
+        pipeline_.build.reset();
         layout_handle_ = p->layout_handle;
         have_pipeline_ = true;
-        list_->SetPipelineState(p->pso.get());
+        if (pso)
+            list_->SetPipelineState(pso.get());
         if (!p->compute)
             list_->IASetPrimitiveTopology(p->topology);
         if (bound_root_ != p->root_signature.get() || bound_compute_ != p->compute) {
@@ -630,7 +642,8 @@ namespace conduit::d3d12 {
             return;
         if (invalid_) {
             invalid_ = false;
-            list_->SetPipelineState(pipeline_.pso.get());
+            if (pipeline_.pso)
+                list_->SetPipelineState(pipeline_.pso.get());
             if (!heaps_set_ && queue_ != queue_type::copy) {
                 ID3D12DescriptorHeap* heaps[2] = {device_.resource_heap_.heap(), device_.sampler_heap_.heap()};
                 list_->SetDescriptorHeaps(2, heaps);
@@ -717,6 +730,8 @@ namespace conduit::d3d12 {
 
     void cmd_list::draw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
                         uint32_t first_instance) {
+        if (pipeline_pending_)
+            return;
         if (!have_pipeline_ || !in_rendering_) {
             fail("Draw without a pipeline or outside a rendering pass");
             return;
@@ -728,6 +743,8 @@ namespace conduit::d3d12 {
 
     void cmd_list::draw_indexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index,
                                 int32_t vertex_offset, uint32_t first_instance) {
+        if (pipeline_pending_)
+            return;
         if (!have_pipeline_ || !in_rendering_ || !have_index_) {
             fail("DrawIndexed without a pipeline, index buffer or rendering pass");
             return;
@@ -738,6 +755,8 @@ namespace conduit::d3d12 {
     }
 
     void cmd_list::draw_indexed_indirect(buffer_handle args, uint64_t offset, uint32_t max_draws, uint32_t stride) {
+        if (pipeline_pending_)
+            return;
         buffer_rec* a = device_.buffers_.get(args);
         if (!a || !have_pipeline_ || !in_rendering_ || !have_index_) {
             fail("DrawIndexedIndirect: missing buffer, pipeline, index buffer or rendering pass");
@@ -758,6 +777,8 @@ namespace conduit::d3d12 {
 
     void cmd_list::draw_indexed_indirect_count(buffer_handle args, uint64_t offset, buffer_handle count_buffer,
                                                uint64_t count_offset, uint32_t max_draws, uint32_t stride) {
+        if (pipeline_pending_)
+            return;
         buffer_rec* a = device_.buffers_.get(args);
         buffer_rec* c = device_.buffers_.get(count_buffer);
         if (!a || !c || !have_pipeline_ || !in_rendering_ || !have_index_) {
@@ -785,6 +806,37 @@ namespace conduit::d3d12 {
         }
         flush_bindings();
         list_->Dispatch(x, y, z);
+        counters_.dispatches++;
+    }
+
+    void cmd_list::dispatch_graph(const void* records, uint32_t count, uint32_t stride) {
+        if (!have_pipeline_ || !pipeline_.graph || in_rendering_) {
+            fail("DispatchGraph without a work graph or inside a rendering pass");
+            return;
+        }
+        const auto list10 = list_.try_as<ID3D12GraphicsCommandList10>();
+        if (!list10) {
+            fail("DispatchGraph: the command list has no ID3D12GraphicsCommandList10 (old runtime)");
+            return;
+        }
+        flush_bindings();
+        D3D12_SET_PROGRAM_DESC sp{};
+        sp.Type = D3D12_PROGRAM_TYPE_WORK_GRAPH;
+        sp.WorkGraph.ProgramIdentifier = pipeline_.program;
+        // the backing memory is initialized by the first program set that uses it, later sets keep its state
+        const bool first = pipeline_.backing_ready && !pipeline_.backing_ready->exchange(true);
+        sp.WorkGraph.Flags = first ? D3D12_SET_WORK_GRAPH_FLAG_INITIALIZE : D3D12_SET_WORK_GRAPH_FLAG_NONE;
+        sp.WorkGraph.BackingMemory = pipeline_.backing_range;
+        list10->SetProgram(&sp);
+        D3D12_DISPATCH_GRAPH_DESC dg{};
+        dg.Mode = D3D12_DISPATCH_MODE_NODE_CPU_INPUT;
+        dg.NodeCPUInput.EntrypointIndex = 0;
+        dg.NodeCPUInput.NumRecords = count;
+        dg.NodeCPUInput.pRecords = records;
+        dg.NodeCPUInput.RecordStrideInBytes = stride;
+        list10->DispatchGraph(&dg);
+        // SetProgram replaced the pipeline state: the next set_pipeline has to bind again
+        have_pipeline_ = false;
         counters_.dispatches++;
     }
 

@@ -101,8 +101,21 @@ namespace conduit::vk {
         std::array<bind_layout_handle, max_bind_groups> sets{};
     };
 
+    // a graphics pipeline compiled on the device's compile threads; the first bind waits a few ms, after that
+    // draws with it are skipped until it is ready: a missing object for a frame instead of a hitch
+    struct pipeline_build {
+        std::atomic<int> state{0};
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        std::string error;
+        std::atomic<bool> waited{false}, reported{false};
+        std::mutex mutex;
+        std::condition_variable done;
+        bool wait_for(uint64_t timeout_ns);
+    };
+
     struct pipeline_rec {
         VkPipeline pipeline = VK_NULL_HANDLE;
+        std::shared_ptr<pipeline_build> build;
         VkPipelineBindPoint bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
         pipeline_layout_handle layout_handle;
         VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -241,6 +254,7 @@ namespace conduit::vk {
 
         pipeline_rec pipeline_;
         bool have_pipeline_ = false;
+        bool pipeline_pending_ = false;
         bool in_rendering_ = false;
         std::array<bind_group_handle, max_bind_groups> groups_{};
         std::array<std::array<uint32_t, max_dynamic_offsets>, max_bind_groups> dynamic_offsets_{};
@@ -366,6 +380,8 @@ namespace conduit::vk {
         VkFramebuffer make_framebuffer(VkRenderPass pass, const VkImageView* views, uint32_t count, uint32_t width,
                                        uint32_t height);
         VkQueue present_queue() const { return queues_[0].queue; }
+        VkPipeline ready_pipeline(const pipeline_rec& p);
+        void drain_pipeline_jobs();
         std::mutex* present_mutex() const { return queues_[0].mutex; }
 
     private:
@@ -460,6 +476,17 @@ namespace conduit::vk {
 
         std::mutex pools_mutex_;
         std::unordered_map<std::thread::id, std::unique_ptr<thread_pools>> thread_pools_;
+
+        struct pipeline_job;
+        void run_pipeline_job(pipeline_job& job);
+        void compile_worker();
+        std::mutex compile_mutex_;
+        std::condition_variable compile_wake_, compile_idle_;
+        std::deque<std::shared_ptr<pipeline_job>> compile_queue_;
+        std::vector<std::thread> compile_threads_;
+        uint32_t compile_running_ = 0;
+        bool compile_stop_ = false;
+        std::atomic<uint64_t> pipelines_pending_{0};
 
         retire_queue retire_;
         uint64_t frame_ = 0;

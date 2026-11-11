@@ -2,6 +2,7 @@
 
 #include "d3d12/d3d12_convert.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -686,6 +687,126 @@ namespace conduit::d3d12 {
         return pipeline_layouts_.alloc(std::move(rec));
     }
 
+    struct device::pipeline_job {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+        std::vector<uint8_t> vs, ps;
+        std::array<D3D12_INPUT_ELEMENT_DESC, max_vertex_attributes> elements{};
+        winrt::com_ptr<ID3D12RootSignature> root;
+        std::wstring library_name;
+        std::string name;
+        uint32_t color_count = 0, attribute_count = 0;
+        std::shared_ptr<pipeline_build> build;
+    };
+
+    bool pipeline_build::wait_for(uint64_t timeout_ns) {
+        std::unique_lock lock(mutex);
+        return done.wait_for(lock, std::chrono::nanoseconds(timeout_ns), [&] { return state.load() != 0; });
+    }
+
+    void device::run_pipeline_job(pipeline_job& job) {
+        // the desc points into the job, which lives on the heap until this returns
+        job.pd.pRootSignature = job.root.get();
+        job.pd.VS = {job.vs.data(), job.vs.size()};
+        if (!job.ps.empty())
+            job.pd.PS = {job.ps.data(), job.ps.size()};
+        job.pd.InputLayout = {job.elements.data(), job.attribute_count};
+        winrt::com_ptr<ID3D12PipelineState> pso;
+        HRESULT hr = E_FAIL;
+        if (pipeline_library_) {
+            std::lock_guard lock(library_mutex_);
+            hr = pipeline_library_->LoadGraphicsPipeline(job.library_name.c_str(), &job.pd,
+                                                         winrt::guid_of<ID3D12PipelineState>(), pso.put_void());
+        }
+        if (FAILED(hr)) {
+            pso = nullptr;
+            hr = device_->CreateGraphicsPipelineState(&job.pd, winrt::guid_of<ID3D12PipelineState>(), pso.put_void());
+            if (SUCCEEDED(hr) && pipeline_library_) {
+                std::lock_guard lock(library_mutex_);
+                pipeline_library_->StorePipeline(job.library_name.c_str(), pso.get());
+            }
+        }
+        pipeline_build& b = *job.build;
+        {
+            std::lock_guard lock(b.mutex);
+            if (SUCCEEDED(hr)) {
+                if (!job.name.empty())
+                    pso->SetName(widen(job.name.c_str()).c_str());
+                b.pso = pso;
+                b.state.store(1, std::memory_order_release);
+            } else {
+                char code[32];
+                std::snprintf(code, sizeof(code), "0x%08X", static_cast<unsigned>(hr));
+                b.error = "CreateGraphicsPipelineState failed (" + std::string(code) + ") for '" + job.name +
+                          "' rt=" + std::to_string(job.color_count) + " attrs=" + std::to_string(job.attribute_count);
+                b.state.store(-1, std::memory_order_release);
+            }
+        }
+        b.done.notify_all();
+    }
+
+    void device::compile_worker() {
+        for (;;) {
+            std::shared_ptr<pipeline_job> job;
+            {
+                std::unique_lock lock(compile_mutex_);
+                compile_wake_.wait(lock, [&] { return compile_stop_ || !compile_queue_.empty(); });
+                if (compile_queue_.empty())
+                    return;
+                job = std::move(compile_queue_.front());
+                compile_queue_.pop_front();
+                compile_running_++;
+            }
+            run_pipeline_job(*job);
+            pipelines_pending_--;
+            {
+                std::lock_guard lock(compile_mutex_);
+                compile_running_--;
+            }
+            compile_idle_.notify_all();
+        }
+    }
+
+    void device::start_compile_threads() {
+        if (!options_.async_pipelines || std::getenv("CONDUIT_SYNC_PIPELINES"))
+            return;
+        const uint32_t cores = (std::max)(1u, std::thread::hardware_concurrency());
+        const uint32_t workers = (std::min)((std::max)(cores / 2, 1u), 4u);
+        for (uint32_t i = 0; i < workers; i++)
+            compile_threads_.emplace_back([this] { compile_worker(); });
+    }
+
+    void device::stop_compile_threads() {
+        {
+            std::lock_guard lock(compile_mutex_);
+            compile_stop_ = true;
+        }
+        compile_wake_.notify_all();
+        for (std::thread& t : compile_threads_)
+            t.join();
+        compile_threads_.clear();
+    }
+
+    void device::drain_pipeline_jobs() {
+        std::unique_lock lock(compile_mutex_);
+        compile_idle_.wait(lock, [&] { return compile_queue_.empty() && compile_running_ == 0; });
+    }
+
+    winrt::com_ptr<ID3D12PipelineState> device::ready_pipeline(const pipeline_rec& p) {
+        if (!p.build)
+            return p.pso;
+        pipeline_build& b = *p.build;
+        int state = b.state.load(std::memory_order_acquire);
+        if (state == 0 && !b.waited.exchange(true)) {
+            b.wait_for(4'000'000ull);
+            state = b.state.load(std::memory_order_acquire);
+        }
+        if (state == 1)
+            return b.pso;
+        if (state < 0 && !b.reported.exchange(true))
+            report_error(b.error);
+        return nullptr;
+    }
+
     pipeline_handle device::create_graphics_pipeline(const graphics_pipeline_desc& desc) {
         pipeline_layout_rec* layout = pipeline_layouts_.get(desc.layout);
         shader_rec* vs = shaders_.get(desc.vertex);
@@ -785,6 +906,40 @@ namespace conduit::d3d12 {
         const std::wstring name = hash_name("g", key);
 
         pipeline_rec rec;
+        rec.root_signature = layout->root_signature;
+        rec.layout_handle = desc.layout;
+        rec.topology = to_d3d(desc.topology);
+        for (uint32_t i = 0; i < desc.stream_count; i++)
+            rec.strides[i] = desc.streams[i].stride;
+        rec.stream_count = desc.stream_count;
+        rec.color_count = desc.color_count;
+        rec.color_formats = desc.color_formats;
+        rec.depth_format = desc.depth_format;
+        rec.push_bytes = layout->push_bytes;
+        if (!compile_threads_.empty()) {
+            auto job = std::make_shared<pipeline_job>();
+            job->pd = pd;
+            job->vs = vs->code;
+            if (fs)
+                job->ps = fs->code;
+            for (uint32_t i = 0; i < desc.attribute_count; i++)
+                job->elements[i] = elements[i];
+            job->attribute_count = desc.attribute_count;
+            job->color_count = desc.color_count;
+            job->root = layout->root_signature;
+            job->library_name = name;
+            job->name = desc.name ? desc.name : "";
+            job->build = std::make_shared<pipeline_build>();
+            rec.build = job->build;
+            pipelines_pending_++;
+            {
+                std::lock_guard lock(compile_mutex_);
+                compile_queue_.push_back(job);
+            }
+            compile_wake_.notify_one();
+            live_pipelines_++;
+            return pipelines_.alloc(std::move(rec));
+        }
         HRESULT hr = E_FAIL;
         if (pipeline_library_) {
             std::lock_guard lock(library_mutex_);
@@ -858,6 +1013,82 @@ namespace conduit::d3d12 {
         }
         if (desc.name)
             rec.pso->SetName(widen(desc.name).c_str());
+        rec.compute = true;
+        rec.root_signature = layout->root_signature;
+        rec.layout_handle = desc.layout;
+        rec.push_bytes = layout->push_bytes;
+        live_pipelines_++;
+        return pipelines_.alloc(std::move(rec));
+    }
+
+    pipeline_handle device::create_work_graph(const work_graph_desc& desc) {
+        if (!caps_.features.work_graphs) {
+            report_error("CreateWorkGraph: the device has no work graphs (tier 1.0)");
+            return {};
+        }
+        pipeline_layout_rec* layout = pipeline_layouts_.get(desc.layout);
+        const auto device5 = device_.try_as<ID3D12Device5>();
+        if (!layout || !device5 || desc.library.empty()) {
+            report_error("CreateWorkGraph: missing layout, library or ID3D12Device5");
+            return {};
+        }
+        const std::wstring program = widen(desc.program ? desc.program : "graph");
+        D3D12_GLOBAL_ROOT_SIGNATURE root{layout->root_signature.get()};
+        D3D12_DXIL_LIBRARY_DESC lib{};
+        lib.DXILLibrary = {desc.library.data(), desc.library.size()};
+        D3D12_WORK_GRAPH_DESC wg{};
+        wg.ProgramName = program.c_str();
+        wg.Flags = D3D12_WORK_GRAPH_FLAG_INCLUDE_ALL_AVAILABLE_NODES;
+        const D3D12_STATE_SUBOBJECT subobjects[] = {
+            {D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &root},
+            {D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &lib},
+            {D3D12_STATE_SUBOBJECT_TYPE_WORK_GRAPH, &wg},
+        };
+        D3D12_STATE_OBJECT_DESC so{};
+        so.Type = D3D12_STATE_OBJECT_TYPE_EXECUTABLE;
+        so.NumSubobjects = static_cast<UINT>(std::size(subobjects));
+        so.pSubobjects = subobjects;
+        pipeline_rec rec;
+        HRESULT hr = device5->CreateStateObject(&so, winrt::guid_of<ID3D12StateObject>(), rec.graph.put_void());
+        if (FAILED(hr)) {
+            report_error("CreateStateObject (work graph) failed: hr " + std::to_string(static_cast<long>(hr)));
+            return {};
+        }
+        const auto props = rec.graph.try_as<ID3D12StateObjectProperties1>();
+        const auto wprops = rec.graph.try_as<ID3D12WorkGraphProperties>();
+        if (!props || !wprops) {
+            report_error("CreateWorkGraph: the state object has no program or work graph properties");
+            return {};
+        }
+        rec.program = props->GetProgramIdentifier(program.c_str());
+        const UINT index = wprops->GetWorkGraphIndex(program.c_str());
+        D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS mem{};
+        wprops->GetWorkGraphMemoryRequirements(index, &mem);
+        if (mem.MaxSizeInBytes) {
+            // the most the driver can use: it schedules better with room, and a culling graph is small
+            const uint64_t size = (std::max<uint64_t>)(mem.MinSizeInBytes, (std::min<uint64_t>)(mem.MaxSizeInBytes, 64ull << 20));
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = size;
+            rd.Height = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            hr = device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                  winrt::guid_of<ID3D12Resource>(), rec.backing.put_void());
+            if (FAILED(hr)) {
+                report_error("CreateWorkGraph: backing memory allocation failed");
+                return {};
+            }
+            rec.backing_range = {rec.backing->GetGPUVirtualAddress(), size};
+        }
+        rec.backing_ready = std::make_shared<std::atomic<bool>>(false);
+        if (desc.name)
+            rec.graph->SetName(widen(desc.name).c_str());
         rec.compute = true;
         rec.root_signature = layout->root_signature;
         rec.layout_handle = desc.layout;
@@ -966,7 +1197,11 @@ namespace conduit::d3d12 {
         if (!pipelines_.free(h, &rec))
             return;
         live_pipelines_--;
-        retire([rec = std::move(rec)]() mutable { rec = pipeline_rec{}; });
+        retire([rec = std::move(rec)]() mutable {
+            if (rec.build)
+                rec.build->wait_for(~0ull >> 2);
+            rec = pipeline_rec{};
+        });
     }
 
     void device::destroy(query_set_handle h) {
@@ -1198,6 +1433,7 @@ namespace conduit::d3d12 {
         s.live_textures = static_cast<uint32_t>(live_textures_.load());
         s.live_pipelines = static_cast<uint32_t>(live_pipelines_.load());
         s.live_bind_groups = static_cast<uint32_t>(live_groups_.load());
+        s.pipelines_pending = (std::max)(s.pipelines_pending, pipelines_pending_.load());
         return s;
     }
 

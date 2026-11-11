@@ -218,6 +218,7 @@ namespace conduit::d3d12 {
     }
 
     device::~device() {
+        stop_compile_threads();
         if (!device_)
             return;
         wait_idle();
@@ -342,11 +343,16 @@ namespace conduit::d3d12 {
             sm.HighestShaderModel = D3D_SHADER_MODEL_6_0;
         f.cooperative_matrix = false;
 
+        D3D12_FEATURE_DATA_D3D12_OPTIONS21 o21{};
+        if (SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS21, &o21, sizeof(o21))))
+            f.work_graphs = o21.WorkGraphsTier >= D3D12_WORK_GRAPHS_TIER_1_0;
         f.multi_draw_indirect = f.draw_indirect_count = f.draw_indirect_first_instance = true;
+        f.gpu_driven = true;
         f.async_compute = options_.allow_async_compute;
         f.dedicated_copy_queue = true;
         f.timestamp_queries = true;
         f.pipeline_cache_blob = static_cast<bool>(pipeline_library_);
+        start_compile_threads();
         f.texture_compression_bc = true;
         f.sampler_anisotropy = true;
         f.shader_int64 = o1.Int64ShaderOps != FALSE;
