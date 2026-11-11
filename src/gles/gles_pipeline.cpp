@@ -300,7 +300,11 @@ namespace conduit::gles {
             std::string error;
             if (!translate_stage(s.source->words, s.source->stage, s.source->entry, features_.glsl_version, *layout,
                                  s.translated, error)) {
-                report_error("shader translation failed (" + label + "): " + error);
+                std::string message = "shader translation failed (";
+                message += label;
+                message += "): ";
+                message += error;
+                report_error(message);
                 return {};
             }
         }

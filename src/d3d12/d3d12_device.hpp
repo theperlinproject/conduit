@@ -107,6 +107,7 @@ namespace conduit::d3d12 {
         uint8_t* mapped = nullptr;
         D3D12_GPU_VIRTUAL_ADDRESS address = 0;
         D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+        bool uav = false;
     };
 
     struct view_set {

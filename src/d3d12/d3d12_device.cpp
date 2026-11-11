@@ -85,12 +85,14 @@ namespace conduit::d3d12 {
         rd.Height = rd.DepthOrArraySize = rd.MipLevels = 1;
         rd.SampleDesc.Count = 1;
         rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (has(desc.usage, buffer_usage::storage))
-            rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-
         memory_class memory = desc.memory;
         if (memory == memory_class::gpu_mappable)
             memory = memory_class::upload;
+        // upload and readback heaps cannot hold unordered-access resources: storage there is read-only (an srv)
+        if (has(desc.usage, buffer_usage::storage) && memory != memory_class::upload &&
+            memory != memory_class::readback)
+            rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        rec.uav = (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
         D3D12MA::ALLOCATION_DESC ad{};
         D3D12_RESOURCE_STATES initial = D3D12_RESOURCE_STATE_COMMON;
         switch (memory) {
@@ -461,6 +463,10 @@ namespace conduit::d3d12 {
                     const auto sv = buffer_srv(e.buffer.offset, size, b->desc.stride);
                     device_->CreateShaderResourceView(b->resource.get(), &sv,
                                                       resource_heap_.cpu(rec.table_offset + slot_index));
+                } else if (!b->uav) {
+                    report_error("CreateBindGroup: binding " + std::to_string(e.binding) +
+                                 " is read-write storage on cpu-visible memory, which d3d12 cannot write");
+                    continue;
                 } else {
                     const auto uv = buffer_uav(e.buffer.offset, size, b->desc.stride);
                     device_->CreateUnorderedAccessView(b->resource.get(), nullptr, &uv,

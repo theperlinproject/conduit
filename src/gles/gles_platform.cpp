@@ -14,7 +14,7 @@
 #else
 #if !defined(_WIN32) && !defined(__ANDROID__)
 #ifndef EGL_NO_X11
-#define EGL_NO_X11 1
+#define EGL_NO_X11 1 // NOLINT(readability-identifier-naming): the EGL header's switch
 #endif
 #endif
 #include <EGL/egl.h>
@@ -72,10 +72,10 @@ namespace conduit::gles {
             return "#canvas";
         }
 
+        // clang-format off: the body is javascript
         EM_JS(int, conduit_gles_probe, (char* vendor, char* renderer, int capacity), {
             try {
-                var canvas =
-                    typeof document != = 'undefined' ? document.createElement('canvas') : new OffscreenCanvas(1, 1);
+                var canvas = typeof document !== 'undefined' ? document.createElement('canvas') : new OffscreenCanvas(1, 1);
                 var gl = canvas.getContext('webgl2');
                 if (!gl)
                     return 0;
@@ -92,6 +92,7 @@ namespace conduit::gles {
                 return 0;
             }
         });
+        // clang-format on
 
         class web_surface final : public gl_surface {
         public:
@@ -223,6 +224,7 @@ namespace conduit::gles {
     X(eglGetError)
 
         struct egl_api {
+// NOLINTNEXTLINE(bugprone-macro-parentheses): name is a declarator
 #define CONDUIT_EGL_DECLARE(name) decltype(&::name) name = nullptr;
             CONDUIT_EGL_FUNCTIONS(CONDUIT_EGL_DECLARE)
 #undef CONDUIT_EGL_DECLARE
@@ -270,12 +272,16 @@ namespace conduit::gles {
         libraries& libs() {
             static libraries l = [] {
                 libraries out;
-                for (const char* name : egl_names)
-                    if ((out.egl = open_library(name)))
+                for (const char* name : egl_names) {
+                    out.egl = open_library(name);
+                    if (out.egl)
                         break;
-                for (const char* name : gles_names)
-                    if ((out.gles = open_library(name)))
+                }
+                for (const char* name : gles_names) {
+                    out.gles = open_library(name);
+                    if (out.gles)
                         break;
+                }
                 if (!out.egl || !out.gles)
                     return out;
                 bool ok = true;
@@ -557,8 +563,10 @@ namespace conduit::gles {
                     reinterpret_cast<wl_egl_window_create_fn>(find_symbol(w->lib, "wl_egl_window_create"));
                 w->resize = reinterpret_cast<wl_egl_window_resize_fn>(find_symbol(w->lib, "wl_egl_window_resize"));
                 w->destroy = reinterpret_cast<wl_egl_window_destroy_fn>(find_symbol(w->lib, "wl_egl_window_destroy"));
-                if (!create || !(w->window = create(window.window, static_cast<int>(std::max(width, 1u)),
-                                                    static_cast<int>(std::max(height, 1u))))) {
+                if (create)
+                    w->window = create(window.window, static_cast<int>(std::max(width, 1u)),
+                                       static_cast<int>(std::max(height, 1u)));
+                if (!create || !w->window) {
                     delete w;
                     return nullptr;
                 }

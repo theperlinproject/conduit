@@ -336,7 +336,6 @@ namespace conduit::gles {
         if (!ok)
             return false;
 
-        std::string renderer = caps_.adapter.name;
         frame_fence_ = create_fence(0);
         return true;
     }
@@ -553,7 +552,7 @@ namespace conduit::gles {
             setup(s.gl_nearest, true);
             return 0;
         });
-        return samplers_.alloc(std::move(s));
+        return samplers_.alloc(s);
     }
 
     shader_handle device::create_shader(const shader_desc& desc) {
@@ -831,14 +830,13 @@ namespace conduit::gles {
         counters_.count_submit();
         std::vector<fence_op> waits(desc.waits.begin(), desc.waits.end());
         std::vector<fence_op> signals(desc.signals.begin(), desc.signals.end());
-        thread_.post(
-            [this, streams = std::move(streams), waits = std::move(waits), signals = std::move(signals)]() mutable {
-                execute(std::move(streams), std::move(waits), std::move(signals));
-            });
+        thread_.post([this, streams = std::move(streams), waits = std::move(waits), signals = std::move(signals)] {
+            execute(streams, waits, signals);
+        });
     }
 
-    void device::execute(std::vector<std::vector<uint8_t>> streams, std::vector<fence_op> waits,
-                         std::vector<fence_op> signals) {
+    void device::execute(const std::vector<std::vector<uint8_t>>& streams, const std::vector<fence_op>& waits,
+                         const std::vector<fence_op>& signals) {
         for (const fence_op& w : waits)
             if (!wait_now(w.fence, w.value, 10'000'000'000ull))
                 report_error("a submit waited 10 seconds on a fence that was never signalled");

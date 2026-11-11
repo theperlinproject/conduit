@@ -2,10 +2,10 @@
 // OpenGL ES entry points, loaded at run time so conduit never links a GL library. Headers come from the Khronos
 // registry (or the NDK / Emscripten); the prototypes they declare are only used to spell the function pointer types.
 #ifndef GL_GLES_PROTOTYPES
-#define GL_GLES_PROTOTYPES 1
+#define GL_GLES_PROTOTYPES 1 // NOLINT(readability-identifier-naming): the Khronos header's switch
 #endif
 #ifndef GL_GLEXT_PROTOTYPES
-#define GL_GLEXT_PROTOTYPES 1
+#define GL_GLEXT_PROTOTYPES 1 // NOLINT(readability-identifier-naming): the Khronos header's switch
 #endif
 #if defined(__has_include) && __has_include(<GLES3/gl32.h>)
 #include <GLES3/gl32.h>
@@ -213,9 +213,11 @@
 
 namespace conduit::gles {
     struct gl_api {
+// NOLINTNEXTLINE(bugprone-macro-parentheses): name is a declarator
 #define CONDUIT_GLES_DECLARE_CORE(name) decltype(&::name) name = nullptr;
         CONDUIT_GLES_CORE(CONDUIT_GLES_DECLARE_CORE)
 #undef CONDUIT_GLES_DECLARE_CORE
+// NOLINTNEXTLINE(bugprone-macro-parentheses): ret, name and args are pieces of a declarator
 #define CONDUIT_GLES_DECLARE_OPTIONAL(name, ret, args) ret(GL_APIENTRY* name) args = nullptr;
         CONDUIT_GLES_OPTIONAL(CONDUIT_GLES_DECLARE_OPTIONAL)
 #undef CONDUIT_GLES_DECLARE_OPTIONAL
@@ -227,7 +229,7 @@ namespace conduit::gles {
             bool ok = true;
 #define CONDUIT_GLES_LOAD_CORE(fn)                                                                                     \
     fn = reinterpret_cast<decltype(&::fn)>(get_proc(#fn));                                                             \
-    ok = ok && fn != nullptr;
+    ok = ok && (fn) != nullptr;
             CONDUIT_GLES_CORE(CONDUIT_GLES_LOAD_CORE)
 #undef CONDUIT_GLES_LOAD_CORE
             const auto find = [&](const char* base) -> void* {

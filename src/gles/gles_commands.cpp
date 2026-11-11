@@ -6,6 +6,11 @@
 
 namespace conduit::gles {
     namespace {
+        // gl takes offsets into the bound buffer as pointers
+        const void* gl_offset(uint64_t offset) {
+            return reinterpret_cast<const void*>(static_cast<uintptr_t>(offset)); // NOLINT(performance-no-int-to-ptr)
+        }
+
         enum op : uint16_t {
             op_memory_barrier,
             op_copy_buffer,
@@ -769,7 +774,7 @@ namespace conduit::gles {
                     const void* data = source;
                     if (from_buffer_object) {
                         gl_.glBindBuffer(GL_PIXEL_UNPACK_BUFFER, b->gl);
-                        data = reinterpret_cast<const void*>(static_cast<uintptr_t>(r.buffer_offset));
+                        data = gl_offset(r.buffer_offset);
                     }
                     upload(*t, r, w, h, depth, data, static_cast<GLsizei>(static_cast<size_t>(tight) * rows));
                     if (from_buffer_object)
@@ -1533,7 +1538,7 @@ namespace conduit::gles {
                             gl_.glBindBuffer(GL_ARRAY_BUFFER, b->gl);
                             c.array_buffer = b->gl;
                         }
-                        const void* pointer = reinterpret_cast<const void*>(static_cast<uintptr_t>(offset));
+                        const void* pointer = gl_offset(offset);
                         if (a.integer)
                             gl_.glVertexAttribIPointer(a.location, a.size, a.type, static_cast<GLsizei>(stream.stride),
                                                        pointer);
@@ -1620,7 +1625,7 @@ namespace conduit::gles {
                     return;
                 const bool wide = index_type_ == index_type::u32;
                 const uint64_t offset = index_offset_ + static_cast<uint64_t>(a.first_index) * (wide ? 4 : 2);
-                const void* at = reinterpret_cast<const void*>(static_cast<uintptr_t>(offset));
+                const void* at = gl_offset(offset);
                 const GLenum type = wide ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
                 if (a.instance_count == 1)
                     gl_.glDrawElements(pipeline_->topology, static_cast<GLsizei>(a.index_count), type, at);
@@ -1643,8 +1648,7 @@ namespace conduit::gles {
                 // one draw per call: ES has no multi draw indirect
                 for (uint32_t i = 0; i < a.max_draws; i++)
                     gl_.glDrawElementsIndirect(pipeline_->topology, type,
-                                               reinterpret_cast<const void*>(static_cast<uintptr_t>(
-                                                   a.offset + static_cast<uint64_t>(i) * stride)));
+                                               gl_offset(a.offset + static_cast<uint64_t>(i) * stride));
             }
 
             bool prepare_dispatch() {

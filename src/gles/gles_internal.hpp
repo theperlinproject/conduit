@@ -534,8 +534,8 @@ namespace conduit::gles {
         GLuint push_ring() const { return push_ring_; }
         uint64_t push_alloc(uint32_t bytes);
         void present_texture(texture_handle texture, gl_surface& surface, present_mode mode);
-        void execute(std::vector<std::vector<uint8_t>> streams, std::vector<fence_op> waits,
-                     std::vector<fence_op> signals);
+        void execute(const std::vector<std::vector<uint8_t>>& streams, const std::vector<fence_op>& waits,
+                     const std::vector<fence_op>& signals);
         void replay(const std::vector<uint8_t>& stream);
         void apply_cache_reset() { cache_.reset(); }
         device_counters& counters() { return counters_; }
