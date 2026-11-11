@@ -126,8 +126,8 @@ namespace conduit::gles {
             if (has(after, state::indirect_argument))
                 bits |= GL_COMMAND_BARRIER_BIT;
             if (has(after, state::shader_read) || has(after, state::shader_write))
-                bits |= GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT |
-                        GL_UNIFORM_BARRIER_BIT;
+                bits |= GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                        GL_SHADER_STORAGE_BARRIER_BIT | GL_UNIFORM_BARRIER_BIT;
             if (has(after, state::copy_src) || has(after, state::copy_dst))
                 bits |= GL_BUFFER_UPDATE_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT;
             if (has(after, state::color_target) || has(after, state::depth_write) || has(after, state::depth_read) ||
@@ -297,8 +297,7 @@ namespace conduit::gles {
 
     void cmd_list::write_timestamp(query_set_handle, uint32_t) {}
 
-    void cmd_list::resolve_queries(query_set_handle, uint32_t, uint32_t count, buffer_handle dst,
-                                   uint64_t dst_offset) {
+    void cmd_list::resolve_queries(query_set_handle, uint32_t, uint32_t count, buffer_handle dst, uint64_t dst_offset) {
         // there are no timestamps in OpenGL ES 3.x: the results read as zero
         emit(op_resolve_queries, p_queries{dst, dst_offset, count});
     }
@@ -394,13 +393,11 @@ namespace conduit::gles {
         }
         const GLenum status = gl_.glCheckFramebufferStatus(GL_FRAMEBUFFER);
         if (status != GL_FRAMEBUFFER_COMPLETE)
-            report_error("a render pass framebuffer is incomplete (status 0x" +
-                         [&] {
-                             char text[16];
-                             std::snprintf(text, sizeof(text), "%X", status);
-                             return std::string(text);
-                         }() +
-                         "): the attachments' formats or sizes do not go together");
+            report_error("a render pass framebuffer is incomplete (status 0x" + [&] {
+                char text[16];
+                std::snprintf(text, sizeof(text), "%X", status);
+                return std::string(text);
+            }() + "): the attachments' formats or sizes do not go together");
         return &framebuffers_.emplace(key, fb).first->second;
     }
 
@@ -557,7 +554,8 @@ namespace conduit::gles {
                     break;
                 case op_draw_indexed_indirect_count:
                     bytes = sizeof(p_indirect);
-                    dev_.report_once("draw_indexed_indirect_count is not available in OpenGL ES: the draws are skipped");
+                    dev_.report_once(
+                        "draw_indexed_indirect_count is not available in OpenGL ES: the draws are skipped");
                     break;
                 case op_dispatch: {
                     const auto a = take<p_dispatch>(p, bytes);
@@ -625,8 +623,8 @@ namespace conduit::gles {
                 buffer* s = dev_.buffer_of(a.src);
                 if (!d || !s)
                     return;
-                const uint64_t size = std::min({a.size, d->size - std::min(a.dst_offset, d->size),
-                                                s->size - std::min(a.src_offset, s->size)});
+                const uint64_t size = std::min(
+                    {a.size, d->size - std::min(a.dst_offset, d->size), s->size - std::min(a.src_offset, s->size)});
                 if (!size)
                     return;
                 if (!s->shadow.empty() && s->desc.memory != memory_class::readback) {
@@ -643,8 +641,9 @@ namespace conduit::gles {
                 if (d->gl && s->gl) {
                     gl_.glBindBuffer(GL_COPY_READ_BUFFER, s->gl);
                     gl_.glBindBuffer(GL_COPY_WRITE_BUFFER, d->gl);
-                    gl_.glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(a.src_offset),
-                                            static_cast<GLintptr>(a.dst_offset), static_cast<GLsizeiptr>(size));
+                    gl_.glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER,
+                                            static_cast<GLintptr>(a.src_offset), static_cast<GLintptr>(a.dst_offset),
+                                            static_cast<GLsizeiptr>(size));
                     return;
                 }
                 if (!d->gl && !d->shadow.empty() && s->gl) {
@@ -674,8 +673,8 @@ namespace conduit::gles {
                 std::vector<uint32_t> words(size / 4, a.value);
                 if (b->gl) {
                     gl_.glBindBuffer(GL_COPY_WRITE_BUFFER, b->gl);
-                    gl_.glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(size),
-                                        words.data());
+                    gl_.glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(offset),
+                                        static_cast<GLsizeiptr>(size), words.data());
                 }
                 if (!b->shadow.empty())
                     std::memcpy(b->shadow.data() + offset, words.data(), size);
@@ -685,14 +684,15 @@ namespace conduit::gles {
                 buffer* b = dev_.buffer_of(a.dst);
                 if (!b)
                     return;
-                const uint64_t size = std::min<uint64_t>(static_cast<uint64_t>(a.count) * 8, b->size - std::min(a.offset, b->size));
+                const uint64_t size =
+                    std::min<uint64_t>(static_cast<uint64_t>(a.count) * 8, b->size - std::min(a.offset, b->size));
                 if (!size)
                     return;
                 std::vector<uint8_t> zeros(size, 0);
                 if (b->gl) {
                     gl_.glBindBuffer(GL_COPY_WRITE_BUFFER, b->gl);
-                    gl_.glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(a.offset), static_cast<GLsizeiptr>(size),
-                                        zeros.data());
+                    gl_.glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(a.offset),
+                                        static_cast<GLsizeiptr>(size), zeros.data());
                 }
                 if (!b->shadow.empty())
                     std::memset(b->shadow.data() + a.offset, 0, size);
@@ -785,8 +785,8 @@ namespace conduit::gles {
                 switch (t.target) {
                 case GL_TEXTURE_2D:
                 case GL_TEXTURE_CUBE_MAP: {
-                    const GLenum target = t.target == GL_TEXTURE_CUBE_MAP ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + r.layer
-                                                                          : GL_TEXTURE_2D;
+                    const GLenum target =
+                        t.target == GL_TEXTURE_CUBE_MAP ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + r.layer : GL_TEXTURE_2D;
                     if (fg.compressed)
                         gl_.glCompressedTexSubImage2D(target, mip, static_cast<GLint>(r.x), static_cast<GLint>(r.y),
                                                       static_cast<GLsizei>(w), static_cast<GLsizei>(h), fg.internal,
@@ -799,14 +799,14 @@ namespace conduit::gles {
                 default: {
                     const GLint z = t.target == GL_TEXTURE_3D ? static_cast<GLint>(r.z) : static_cast<GLint>(r.layer);
                     if (fg.compressed)
-                        gl_.glCompressedTexSubImage3D(t.target, mip, static_cast<GLint>(r.x), static_cast<GLint>(r.y), z,
-                                                      static_cast<GLsizei>(w), static_cast<GLsizei>(h),
+                        gl_.glCompressedTexSubImage3D(t.target, mip, static_cast<GLint>(r.x), static_cast<GLint>(r.y),
+                                                      z, static_cast<GLsizei>(w), static_cast<GLsizei>(h),
                                                       static_cast<GLsizei>(depth), fg.internal,
                                                       slice_bytes * static_cast<GLsizei>(depth), data);
                     else
                         gl_.glTexSubImage3D(t.target, mip, static_cast<GLint>(r.x), static_cast<GLint>(r.y), z,
-                                            static_cast<GLsizei>(w), static_cast<GLsizei>(h), static_cast<GLsizei>(depth),
-                                            fg.format, fg.type, data);
+                                            static_cast<GLsizei>(w), static_cast<GLsizei>(h),
+                                            static_cast<GLsizei>(depth), fg.format, fg.type, data);
                     break;
                 }
                 }
@@ -817,8 +817,9 @@ namespace conduit::gles {
                 const GLenum target = read ? GL_READ_FRAMEBUFFER : GL_DRAW_FRAMEBUFFER;
                 dev_.bind_framebuffer(target, dev_.scratch_framebuffer(read));
                 const bool depth = is_depth_format(t.desc.format);
-                const GLenum point = depth ? (has_stencil(t.desc.format) ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT)
-                                           : GL_COLOR_ATTACHMENT0;
+                const GLenum point =
+                    depth ? (has_stencil(t.desc.format) ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT)
+                          : GL_COLOR_ATTACHMENT0;
                 // clear the attachment points that could be left from an earlier use
                 for (const GLenum other : {GL_COLOR_ATTACHMENT0, GL_DEPTH_STENCIL_ATTACHMENT})
                     if (other != point)
@@ -831,7 +832,8 @@ namespace conduit::gles {
                     gl_.glFramebufferTexture2D(target, point, GL_TEXTURE_CUBE_MAP_POSITIVE_X + layer, t.gl,
                                                static_cast<GLint>(mip));
                 else
-                    gl_.glFramebufferTextureLayer(target, point, t.gl, static_cast<GLint>(mip), static_cast<GLint>(layer));
+                    gl_.glFramebufferTextureLayer(target, point, t.gl, static_cast<GLint>(mip),
+                                                  static_cast<GLint>(layer));
                 if (read) {
                     gl_.glReadBuffer(depth ? GL_NONE : GL_COLOR_ATTACHMENT0);
                 } else {
@@ -866,23 +868,23 @@ namespace conduit::gles {
                         const auto z_of = [](const texture& t, uint32_t layer) {
                             return t.target == GL_TEXTURE_2D ? 0 : static_cast<GLint>(layer);
                         };
-                        gl_.glCopyImageSubData(s->gl, s->target, static_cast<GLint>(r.src_mip), static_cast<GLint>(r.src_x),
-                                               static_cast<GLint>(r.src_y), z_of(*s, r.src_layer), d->gl, d->target,
-                                               static_cast<GLint>(r.dst_mip), static_cast<GLint>(r.dst_x),
-                                               static_cast<GLint>(r.dst_y), z_of(*d, r.dst_layer),
-                                               static_cast<GLsizei>(w), static_cast<GLsizei>(h), 1);
+                        gl_.glCopyImageSubData(
+                            s->gl, s->target, static_cast<GLint>(r.src_mip), static_cast<GLint>(r.src_x),
+                            static_cast<GLint>(r.src_y), z_of(*s, r.src_layer), d->gl, d->target,
+                            static_cast<GLint>(r.dst_mip), static_cast<GLint>(r.dst_x), static_cast<GLint>(r.dst_y),
+                            z_of(*d, r.dst_layer), static_cast<GLsizei>(w), static_cast<GLsizei>(h), 1);
                         continue;
                     }
                     attach_scratch(true, *s, r.src_mip, r.src_layer);
                     attach_scratch(false, *d, r.dst_mip, r.dst_layer);
                     dev_.use_scissor_test(false);
-                    gl_.glBlitFramebuffer(static_cast<GLint>(r.src_x), static_cast<GLint>(r.src_y),
-                                          static_cast<GLint>(r.src_x + w), static_cast<GLint>(r.src_y + h),
-                                          static_cast<GLint>(r.dst_x), static_cast<GLint>(r.dst_y),
-                                          static_cast<GLint>(r.dst_x + w), static_cast<GLint>(r.dst_y + h),
-                                          depth ? (GL_DEPTH_BUFFER_BIT | (has_stencil(s->desc.format) ? GL_STENCIL_BUFFER_BIT : 0))
-                                                : GL_COLOR_BUFFER_BIT,
-                                          GL_NEAREST);
+                    gl_.glBlitFramebuffer(
+                        static_cast<GLint>(r.src_x), static_cast<GLint>(r.src_y), static_cast<GLint>(r.src_x + w),
+                        static_cast<GLint>(r.src_y + h), static_cast<GLint>(r.dst_x), static_cast<GLint>(r.dst_y),
+                        static_cast<GLint>(r.dst_x + w), static_cast<GLint>(r.dst_y + h),
+                        depth ? (GL_DEPTH_BUFFER_BIT | (has_stencil(s->desc.format) ? GL_STENCIL_BUFFER_BIT : 0))
+                              : GL_COLOR_BUFFER_BIT,
+                        GL_NEAREST);
                 }
                 detach_scratch();
             }
@@ -901,10 +903,11 @@ namespace conduit::gles {
                 attach_scratch(false, d, dst_mip, dst_layer);
                 dev_.use_scissor_test(false);
                 const GLint w = static_cast<GLint>(s.desc.width), h = static_cast<GLint>(s.desc.height);
-                gl_.glBlitFramebuffer(0, 0, w, h, 0, 0, w, h,
-                                      depth ? (GL_DEPTH_BUFFER_BIT | (has_stencil(s.desc.format) ? GL_STENCIL_BUFFER_BIT : 0))
-                                            : GL_COLOR_BUFFER_BIT,
-                                      GL_NEAREST);
+                gl_.glBlitFramebuffer(
+                    0, 0, w, h, 0, 0, w, h,
+                    depth ? (GL_DEPTH_BUFFER_BIT | (has_stencil(s.desc.format) ? GL_STENCIL_BUFFER_BIT : 0))
+                          : GL_COLOR_BUFFER_BIT,
+                    GL_NEAREST);
                 detach_scratch();
             }
 
@@ -914,7 +917,8 @@ namespace conduit::gles {
                 if (!t || !b || b->shadow.empty())
                     return;
                 if (t->renderbuffer || t->fmt.compressed || is_depth_format(t->desc.format)) {
-                    dev_.report_once("reading back multisampled, compressed or depth textures is not available in OpenGL ES");
+                    dev_.report_once(
+                        "reading back multisampled, compressed or depth textures is not available in OpenGL ES");
                     return;
                 }
                 const format_info& info = get_format_info(t->desc.format);
@@ -976,7 +980,8 @@ namespace conduit::gles {
                         for (uint32_t x = 0; x < w; x++) {
                             uint8_t* px = row + static_cast<size_t>(x) * info.bytes_per_block;
                             if (fam == family::bytes) {
-                                const uint8_t* src = reinterpret_cast<const uint8_t*>(wide.data()) + (static_cast<size_t>(y) * w + x) * 4;
+                                const uint8_t* src = reinterpret_cast<const uint8_t*>(wide.data()) +
+                                                     (static_cast<size_t>(y) * w + x) * 4;
                                 uint8_t rgba[4] = {src[0], src[1], src[2], src[3]};
                                 if (t->fmt.swap_rb)
                                     std::swap(rgba[0], rgba[2]);
@@ -1080,7 +1085,8 @@ namespace conduit::gles {
                 const bool depth_clear = depth && desc_.depth.load == load_op::clear;
                 clearing = clearing || depth_clear;
                 if (depth && desc_.depth.load == load_op::dont_care)
-                    discard[discards++] = has_stencil(depth->desc.format) ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
+                    discard[discards++] =
+                        has_stencil(depth->desc.format) ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
                 if (discards)
                     gl_.glInvalidateFramebuffer(GL_FRAMEBUFFER, discards, discard);
                 if (!clearing)
@@ -1137,7 +1143,8 @@ namespace conduit::gles {
                             gl_.glReadBuffer(GL_COLOR_ATTACHMENT0 + i);
                             attach_scratch_draw_only(*resolve_to);
                             dev_.use_scissor_test(false);
-                            const GLint w = static_cast<GLint>(from->desc.width), h = static_cast<GLint>(from->desc.height);
+                            const GLint w = static_cast<GLint>(from->desc.width),
+                                        h = static_cast<GLint>(from->desc.height);
                             gl_.glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
                             gl_.glReadBuffer(GL_COLOR_ATTACHMENT0);
                         }
@@ -1147,7 +1154,8 @@ namespace conduit::gles {
                 }
                 if (const texture* depth = dev_.texture_of(desc_.depth.texture))
                     if (desc_.depth.store == store_op::dont_care || desc_.depth.read_only)
-                        discard[discards++] = has_stencil(depth->desc.format) ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
+                        discard[discards++] =
+                            has_stencil(depth->desc.format) ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
                 if (discards) {
                     dev_.bind_framebuffer(GL_FRAMEBUFFER, pass_fbo_);
                     gl_.glInvalidateFramebuffer(GL_FRAMEBUFFER, discards, discard);
@@ -1364,9 +1372,10 @@ namespace conduit::gles {
                         if (!buf || !buf->gl)
                             continue;
                         const uint64_t offset = std::min(e->buffer.offset, buf->size);
-                        const uint64_t size = e->buffer.size ? std::min(e->buffer.size, buf->size - offset) : buf->size - offset;
-                        gl_.glBindBufferRange(GL_SHADER_STORAGE_BUFFER, slot.index, buf->gl, static_cast<GLintptr>(offset),
-                                              static_cast<GLsizeiptr>(size));
+                        const uint64_t size =
+                            e->buffer.size ? std::min(e->buffer.size, buf->size - offset) : buf->size - offset;
+                        gl_.glBindBufferRange(GL_SHADER_STORAGE_BUFFER, slot.index, buf->gl,
+                                              static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(size));
                         break;
                     }
                     case binding_type::storage_texture_rw: {
@@ -1374,8 +1383,8 @@ namespace conduit::gles {
                         if (!t || t->renderbuffer || !gl_.glBindImageTexture)
                             continue;
                         const bool layered = t->target != GL_TEXTURE_2D;
-                        gl_.glBindImageTexture(slot.index, t->gl, static_cast<GLint>(e->texture.range.base_mip), layered,
-                                               static_cast<GLint>(e->texture.range.base_layer), GL_READ_WRITE,
+                        gl_.glBindImageTexture(slot.index, t->gl, static_cast<GLint>(e->texture.range.base_mip),
+                                               layered, static_cast<GLint>(e->texture.range.base_layer), GL_READ_WRITE,
                                                t->fmt.internal);
                         break;
                     }
@@ -1396,19 +1405,21 @@ namespace conduit::gles {
                     const uint64_t slot = dev_.push_alloc(static_cast<uint32_t>(align_up(size, 16)));
                     gl_.glBindBuffer(GL_COPY_WRITE_BUFFER, dev_.push_ring());
                     if (upload_class) {
-                        gl_.glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(slot), static_cast<GLsizeiptr>(size),
-                                            buf.shadow.data() + offset);
+                        gl_.glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(slot),
+                                            static_cast<GLsizeiptr>(size), buf.shadow.data() + offset);
                     } else {
                         gl_.glBindBuffer(GL_COPY_READ_BUFFER, buf.gl);
-                        gl_.glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(offset),
-                                                static_cast<GLintptr>(slot), static_cast<GLsizeiptr>(size));
+                        gl_.glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER,
+                                                static_cast<GLintptr>(offset), static_cast<GLintptr>(slot),
+                                                static_cast<GLsizeiptr>(size));
                     }
                     source = dev_.push_ring();
                     at = static_cast<GLintptr>(slot);
                 } else if (upload_class) {
                     // what the application wrote is in the shadow: constant data is small, so it goes up every time
                     gl_.glBindBuffer(GL_COPY_WRITE_BUFFER, buf.gl);
-                    gl_.glBufferSubData(GL_COPY_WRITE_BUFFER, at, static_cast<GLsizeiptr>(size), buf.shadow.data() + offset);
+                    gl_.glBufferSubData(GL_COPY_WRITE_BUFFER, at, static_cast<GLsizeiptr>(size),
+                                        buf.shadow.data() + offset);
                 }
                 gl_.glBindBufferRange(GL_UNIFORM_BUFFER, index, source, at, static_cast<GLsizeiptr>(size));
             }
@@ -1419,9 +1430,10 @@ namespace conduit::gles {
                 if (!s)
                     return dev_.default_sampler();
                 const format_info& info = get_format_info(t.desc.format);
-                const bool wide_float = info.floating && !info.depth && info.bytes_per_block / std::max<uint8_t>(info.channels, 1) == 4;
-                const bool unfilterable = t.fmt.integer || (info.depth && !s->desc.compare) ||
-                                          (wide_float && !dev_.features().float_linear);
+                const bool wide_float =
+                    info.floating && !info.depth && info.bytes_per_block / std::max<uint8_t>(info.channels, 1) == 4;
+                const bool unfilterable =
+                    t.fmt.integer || (info.depth && !s->desc.compare) || (wide_float && !dev_.features().float_linear);
                 return unfilterable ? s->gl_nearest : s->gl;
             }
 
@@ -1437,8 +1449,9 @@ namespace conduit::gles {
                     dev_.use_texture(c.unit, t->target, t->gl);
                     const subresource_range& range = te->texture.range;
                     const int base = static_cast<int>(std::min<uint32_t>(range.base_mip, t->levels - 1));
-                    const int last = range.mip_count ? std::min(base + static_cast<int>(range.mip_count) - 1, t->levels - 1)
-                                                     : t->levels - 1;
+                    const int last = range.mip_count
+                                         ? std::min(base + static_cast<int>(range.mip_count) - 1, t->levels - 1)
+                                         : t->levels - 1;
                     if (t->base_level != base) {
                         gl_.glTexParameteri(t->target, GL_TEXTURE_BASE_LEVEL, base);
                         t->base_level = base;
@@ -1481,8 +1494,8 @@ namespace conduit::gles {
                     gl_.glBindBuffer(GL_COPY_WRITE_BUFFER, dev_.push_ring());
                     gl_.glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(at), static_cast<GLsizeiptr>(bytes),
                                         push_.data());
-                    gl_.glBindBufferRange(GL_UNIFORM_BUFFER, layout->push_slot, dev_.push_ring(), static_cast<GLintptr>(at),
-                                          static_cast<GLsizeiptr>(bytes));
+                    gl_.glBindBufferRange(GL_UNIFORM_BUFFER, layout->push_slot, dev_.push_ring(),
+                                          static_cast<GLintptr>(at), static_cast<GLsizeiptr>(bytes));
                     push_dirty_ = false;
                 }
                 return true;
@@ -1502,7 +1515,8 @@ namespace conduit::gles {
                     const bool per_instance = stream.step == vertex_step::instance;
                     // there is no base vertex or base instance before ES 3.2 and its extensions: start the arrays later
                     const int64_t base = per_instance ? base_instance : base_vertex;
-                    const int64_t offset = static_cast<int64_t>(vertex_[a.stream].offset) + a.offset + base * stream.stride;
+                    const int64_t offset =
+                        static_cast<int64_t>(vertex_[a.stream].offset) + a.offset + base * stream.stride;
                     if (offset < 0)
                         continue;
                     used |= 1u << a.location;
@@ -1521,7 +1535,8 @@ namespace conduit::gles {
                         }
                         const void* pointer = reinterpret_cast<const void*>(static_cast<uintptr_t>(offset));
                         if (a.integer)
-                            gl_.glVertexAttribIPointer(a.location, a.size, a.type, static_cast<GLsizei>(stream.stride), pointer);
+                            gl_.glVertexAttribIPointer(a.location, a.size, a.type, static_cast<GLsizei>(stream.stride),
+                                                       pointer);
                         else
                             gl_.glVertexAttribPointer(a.location, a.size, a.type, a.normalized ? GL_TRUE : GL_FALSE,
                                                       static_cast<GLsizei>(stream.stride), pointer);
@@ -1578,10 +1593,12 @@ namespace conduit::gles {
                 if (!prepare_draw(0, a.first_instance))
                     return;
                 if (a.instance_count == 1)
-                    gl_.glDrawArrays(pipeline_->topology, static_cast<GLint>(a.first_vertex), static_cast<GLsizei>(a.vertex_count));
+                    gl_.glDrawArrays(pipeline_->topology, static_cast<GLint>(a.first_vertex),
+                                     static_cast<GLsizei>(a.vertex_count));
                 else
                     gl_.glDrawArraysInstanced(pipeline_->topology, static_cast<GLint>(a.first_vertex),
-                                              static_cast<GLsizei>(a.vertex_count), static_cast<GLsizei>(a.instance_count));
+                                              static_cast<GLsizei>(a.vertex_count),
+                                              static_cast<GLsizei>(a.instance_count));
             }
 
             bool bind_index_buffer() {
@@ -1626,7 +1643,8 @@ namespace conduit::gles {
                 // one draw per call: ES has no multi draw indirect
                 for (uint32_t i = 0; i < a.max_draws; i++)
                     gl_.glDrawElementsIndirect(pipeline_->topology, type,
-                                               reinterpret_cast<const void*>(static_cast<uintptr_t>(a.offset + static_cast<uint64_t>(i) * stride)));
+                                               reinterpret_cast<const void*>(static_cast<uintptr_t>(
+                                                   a.offset + static_cast<uint64_t>(i) * stride)));
             }
 
             bool prepare_dispatch() {

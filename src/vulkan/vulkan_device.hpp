@@ -441,8 +441,7 @@ namespace conduit::vk {
         void poll_timeline(timeline& t);
         std::shared_ptr<pooled_fence> acquire_fence();
         VkResult queue_submit(queue_info& q, std::span<const VkCommandBuffer> cmds, std::span<const timeline_op> waits,
-                              std::span<const timeline_op> signals, VkSemaphore binary_wait,
-                              VkSemaphore binary_signal);
+                              std::span<const timeline_op> signals, VkSemaphore binary_wait, VkSemaphore binary_signal);
 
         std::mutex fence_pool_mutex_;
         std::vector<VkFence> free_fences_;

@@ -21,129 +21,130 @@
 #include <string>
 
 // every function used unconditionally: OpenGL ES 3.0, which is also what WebGL 2 exposes
-#define CONDUIT_GLES_CORE(X)                                                                                         \
-    X(glGetString)                                                                                                   \
-    X(glGetStringi)                                                                                                  \
-    X(glGetIntegerv)                                                                                                 \
-    X(glGetFloatv)                                                                                                   \
-    X(glGetError)                                                                                                    \
-    X(glEnable)                                                                                                      \
-    X(glDisable)                                                                                                     \
-    X(glFlush)                                                                                                       \
-    X(glFinish)                                                                                                      \
-    X(glPixelStorei)                                                                                                 \
-    X(glViewport)                                                                                                    \
-    X(glScissor)                                                                                                     \
-    X(glDepthRangef)                                                                                                 \
-    X(glClearBufferfv)                                                                                               \
-    X(glClearBufferiv)                                                                                               \
-    X(glClearBufferuiv)                                                                                              \
-    X(glClearBufferfi)                                                                                               \
-    X(glColorMask)                                                                                                   \
-    X(glDepthMask)                                                                                                   \
-    X(glStencilMaskSeparate)                                                                                         \
-    X(glDepthFunc)                                                                                                   \
-    X(glStencilFuncSeparate)                                                                                         \
-    X(glStencilOpSeparate)                                                                                           \
-    X(glBlendFuncSeparate)                                                                                           \
-    X(glBlendEquationSeparate)                                                                                       \
-    X(glBlendColor)                                                                                                  \
-    X(glCullFace)                                                                                                    \
-    X(glFrontFace)                                                                                                   \
-    X(glPolygonOffset)                                                                                               \
-    X(glGenBuffers)                                                                                                  \
-    X(glDeleteBuffers)                                                                                               \
-    X(glBindBuffer)                                                                                                  \
-    X(glBufferData)                                                                                                  \
-    X(glBufferSubData)                                                                                               \
-    X(glBindBufferRange)                                                                                             \
-    X(glCopyBufferSubData)                                                                                           \
-    X(glGenTextures)                                                                                                 \
-    X(glDeleteTextures)                                                                                              \
-    X(glBindTexture)                                                                                                 \
-    X(glActiveTexture)                                                                                               \
-    X(glTexStorage2D)                                                                                                \
-    X(glTexStorage3D)                                                                                                \
-    X(glTexSubImage2D)                                                                                               \
-    X(glTexSubImage3D)                                                                                               \
-    X(glCompressedTexSubImage2D)                                                                                     \
-    X(glCompressedTexSubImage3D)                                                                                     \
-    X(glTexParameteri)                                                                                               \
-    X(glGenSamplers)                                                                                                 \
-    X(glDeleteSamplers)                                                                                              \
-    X(glBindSampler)                                                                                                 \
-    X(glSamplerParameteri)                                                                                           \
-    X(glSamplerParameterf)                                                                                           \
-    X(glGenFramebuffers)                                                                                             \
-    X(glDeleteFramebuffers)                                                                                          \
-    X(glBindFramebuffer)                                                                                             \
-    X(glFramebufferTexture2D)                                                                                        \
-    X(glFramebufferTextureLayer)                                                                                     \
-    X(glFramebufferRenderbuffer)                                                                                     \
-    X(glCheckFramebufferStatus)                                                                                      \
-    X(glDrawBuffers)                                                                                                 \
-    X(glReadBuffer)                                                                                                  \
-    X(glBlitFramebuffer)                                                                                             \
-    X(glInvalidateFramebuffer)                                                                                       \
-    X(glReadPixels)                                                                                                  \
-    X(glGenRenderbuffers)                                                                                            \
-    X(glDeleteRenderbuffers)                                                                                         \
-    X(glBindRenderbuffer)                                                                                            \
-    X(glRenderbufferStorageMultisample)                                                                              \
-    X(glCreateShader)                                                                                                \
-    X(glShaderSource)                                                                                                \
-    X(glCompileShader)                                                                                               \
-    X(glGetShaderiv)                                                                                                 \
-    X(glGetShaderInfoLog)                                                                                            \
-    X(glDeleteShader)                                                                                                \
-    X(glCreateProgram)                                                                                               \
-    X(glAttachShader)                                                                                                \
-    X(glLinkProgram)                                                                                                 \
-    X(glGetProgramiv)                                                                                                \
-    X(glGetProgramInfoLog)                                                                                           \
-    X(glDeleteProgram)                                                                                               \
-    X(glUseProgram)                                                                                                  \
-    X(glGetUniformLocation)                                                                                          \
-    X(glGetUniformBlockIndex)                                                                                        \
-    X(glUniformBlockBinding)                                                                                         \
-    X(glUniform1i)                                                                                                   \
-    X(glGenVertexArrays)                                                                                             \
-    X(glBindVertexArray)                                                                                             \
-    X(glDeleteVertexArrays)                                                                                          \
-    X(glEnableVertexAttribArray)                                                                                     \
-    X(glDisableVertexAttribArray)                                                                                    \
-    X(glVertexAttribPointer)                                                                                         \
-    X(glVertexAttribIPointer)                                                                                        \
-    X(glVertexAttribDivisor)                                                                                         \
-    X(glDrawArrays)                                                                                                  \
-    X(glDrawArraysInstanced)                                                                                         \
-    X(glDrawElements)                                                                                                \
-    X(glDrawElementsInstanced)                                                                                       \
-    X(glFenceSync)                                                                                                   \
-    X(glDeleteSync)                                                                                                  \
+#define CONDUIT_GLES_CORE(X)                                                                                           \
+    X(glGetString)                                                                                                     \
+    X(glGetStringi)                                                                                                    \
+    X(glGetIntegerv)                                                                                                   \
+    X(glGetFloatv)                                                                                                     \
+    X(glGetError)                                                                                                      \
+    X(glEnable)                                                                                                        \
+    X(glDisable)                                                                                                       \
+    X(glFlush)                                                                                                         \
+    X(glFinish)                                                                                                        \
+    X(glPixelStorei)                                                                                                   \
+    X(glViewport)                                                                                                      \
+    X(glScissor)                                                                                                       \
+    X(glDepthRangef)                                                                                                   \
+    X(glClearBufferfv)                                                                                                 \
+    X(glClearBufferiv)                                                                                                 \
+    X(glClearBufferuiv)                                                                                                \
+    X(glClearBufferfi)                                                                                                 \
+    X(glColorMask)                                                                                                     \
+    X(glDepthMask)                                                                                                     \
+    X(glStencilMaskSeparate)                                                                                           \
+    X(glDepthFunc)                                                                                                     \
+    X(glStencilFuncSeparate)                                                                                           \
+    X(glStencilOpSeparate)                                                                                             \
+    X(glBlendFuncSeparate)                                                                                             \
+    X(glBlendEquationSeparate)                                                                                         \
+    X(glBlendColor)                                                                                                    \
+    X(glCullFace)                                                                                                      \
+    X(glFrontFace)                                                                                                     \
+    X(glPolygonOffset)                                                                                                 \
+    X(glGenBuffers)                                                                                                    \
+    X(glDeleteBuffers)                                                                                                 \
+    X(glBindBuffer)                                                                                                    \
+    X(glBufferData)                                                                                                    \
+    X(glBufferSubData)                                                                                                 \
+    X(glBindBufferRange)                                                                                               \
+    X(glCopyBufferSubData)                                                                                             \
+    X(glGenTextures)                                                                                                   \
+    X(glDeleteTextures)                                                                                                \
+    X(glBindTexture)                                                                                                   \
+    X(glActiveTexture)                                                                                                 \
+    X(glTexStorage2D)                                                                                                  \
+    X(glTexStorage3D)                                                                                                  \
+    X(glTexSubImage2D)                                                                                                 \
+    X(glTexSubImage3D)                                                                                                 \
+    X(glCompressedTexSubImage2D)                                                                                       \
+    X(glCompressedTexSubImage3D)                                                                                       \
+    X(glTexParameteri)                                                                                                 \
+    X(glGenSamplers)                                                                                                   \
+    X(glDeleteSamplers)                                                                                                \
+    X(glBindSampler)                                                                                                   \
+    X(glSamplerParameteri)                                                                                             \
+    X(glSamplerParameterf)                                                                                             \
+    X(glGenFramebuffers)                                                                                               \
+    X(glDeleteFramebuffers)                                                                                            \
+    X(glBindFramebuffer)                                                                                               \
+    X(glFramebufferTexture2D)                                                                                          \
+    X(glFramebufferTextureLayer)                                                                                       \
+    X(glFramebufferRenderbuffer)                                                                                       \
+    X(glCheckFramebufferStatus)                                                                                        \
+    X(glDrawBuffers)                                                                                                   \
+    X(glReadBuffer)                                                                                                    \
+    X(glBlitFramebuffer)                                                                                               \
+    X(glInvalidateFramebuffer)                                                                                         \
+    X(glReadPixels)                                                                                                    \
+    X(glGenRenderbuffers)                                                                                              \
+    X(glDeleteRenderbuffers)                                                                                           \
+    X(glBindRenderbuffer)                                                                                              \
+    X(glRenderbufferStorageMultisample)                                                                                \
+    X(glCreateShader)                                                                                                  \
+    X(glShaderSource)                                                                                                  \
+    X(glCompileShader)                                                                                                 \
+    X(glGetShaderiv)                                                                                                   \
+    X(glGetShaderInfoLog)                                                                                              \
+    X(glDeleteShader)                                                                                                  \
+    X(glCreateProgram)                                                                                                 \
+    X(glAttachShader)                                                                                                  \
+    X(glLinkProgram)                                                                                                   \
+    X(glGetProgramiv)                                                                                                  \
+    X(glGetProgramInfoLog)                                                                                             \
+    X(glDeleteProgram)                                                                                                 \
+    X(glUseProgram)                                                                                                    \
+    X(glGetUniformLocation)                                                                                            \
+    X(glGetUniformBlockIndex)                                                                                          \
+    X(glUniformBlockBinding)                                                                                           \
+    X(glUniform1i)                                                                                                     \
+    X(glGenVertexArrays)                                                                                               \
+    X(glBindVertexArray)                                                                                               \
+    X(glDeleteVertexArrays)                                                                                            \
+    X(glEnableVertexAttribArray)                                                                                       \
+    X(glDisableVertexAttribArray)                                                                                      \
+    X(glVertexAttribPointer)                                                                                           \
+    X(glVertexAttribIPointer)                                                                                          \
+    X(glVertexAttribDivisor)                                                                                           \
+    X(glDrawArrays)                                                                                                    \
+    X(glDrawArraysInstanced)                                                                                           \
+    X(glDrawElements)                                                                                                  \
+    X(glDrawElementsInstanced)                                                                                         \
+    X(glFenceSync)                                                                                                     \
+    X(glDeleteSync)                                                                                                    \
     X(glClientWaitSync)
 
 // OpenGL ES 3.1, 3.2 and extension entry points. Any of these may be null. The types are spelled out so the table
 // builds against headers that stop at ES 3.0 (Emscripten) and so one name can come from either core or an extension.
-#define CONDUIT_GLES_OPTIONAL(X)                                                                                     \
-    X(glMapBufferRange, void*, (GLenum, GLintptr, GLsizeiptr, GLbitfield))                                           \
-    X(glUnmapBuffer, GLboolean, (GLenum))                                                                            \
-    X(glDispatchCompute, void, (GLuint, GLuint, GLuint))                                                             \
-    X(glDispatchComputeIndirect, void, (GLintptr))                                                                   \
-    X(glDrawElementsIndirect, void, (GLenum, GLenum, const void*))                                                   \
-    X(glDrawArraysIndirect, void, (GLenum, const void*))                                                             \
-    X(glMemoryBarrier, void, (GLbitfield))                                                                           \
-    X(glBindImageTexture, void, (GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum))                           \
-    X(glCopyImageSubData, void, (GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint,    \
-                                 GLint, GLsizei, GLsizei, GLsizei))                                                  \
-    X(glPushDebugGroup, void, (GLenum, GLuint, GLsizei, const GLchar*))                                              \
-    X(glPopDebugGroup, void, ())                                                                                     \
-    X(glBlendFuncSeparatei, void, (GLuint, GLenum, GLenum, GLenum, GLenum))                                          \
-    X(glBlendEquationSeparatei, void, (GLuint, GLenum, GLenum))                                                      \
-    X(glColorMaski, void, (GLuint, GLboolean, GLboolean, GLboolean, GLboolean))                                      \
-    X(glEnablei, void, (GLenum, GLuint))                                                                             \
-    X(glDisablei, void, (GLenum, GLuint))                                                                            \
-    X(glSamplerParameterfv, void, (GLuint, GLenum, const GLfloat*))                                                  \
+#define CONDUIT_GLES_OPTIONAL(X)                                                                                       \
+    X(glMapBufferRange, void*, (GLenum, GLintptr, GLsizeiptr, GLbitfield))                                             \
+    X(glUnmapBuffer, GLboolean, (GLenum))                                                                              \
+    X(glDispatchCompute, void, (GLuint, GLuint, GLuint))                                                               \
+    X(glDispatchComputeIndirect, void, (GLintptr))                                                                     \
+    X(glDrawElementsIndirect, void, (GLenum, GLenum, const void*))                                                     \
+    X(glDrawArraysIndirect, void, (GLenum, const void*))                                                               \
+    X(glMemoryBarrier, void, (GLbitfield))                                                                             \
+    X(glBindImageTexture, void, (GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum))                             \
+    X(glCopyImageSubData, void,                                                                                        \
+      (GLuint, GLenum, GLint, GLint, GLint, GLint, GLuint, GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei,       \
+       GLsizei))                                                                                                       \
+    X(glPushDebugGroup, void, (GLenum, GLuint, GLsizei, const GLchar*))                                                \
+    X(glPopDebugGroup, void, ())                                                                                       \
+    X(glBlendFuncSeparatei, void, (GLuint, GLenum, GLenum, GLenum, GLenum))                                            \
+    X(glBlendEquationSeparatei, void, (GLuint, GLenum, GLenum))                                                        \
+    X(glColorMaski, void, (GLuint, GLboolean, GLboolean, GLboolean, GLboolean))                                        \
+    X(glEnablei, void, (GLenum, GLuint))                                                                               \
+    X(glDisablei, void, (GLenum, GLuint))                                                                              \
+    X(glSamplerParameterfv, void, (GLuint, GLenum, const GLfloat*))                                                    \
     X(glUniform1iv, void, (GLint, GLsizei, const GLint*))
 
 // values that only exist in newer headers, or only in extension headers
@@ -224,8 +225,8 @@ namespace conduit::gles {
         // their EXT and OES names; whether the extension is actually there is for the caller to check
         bool load(const std::function<void*(const char*)>& get_proc) {
             bool ok = true;
-#define CONDUIT_GLES_LOAD_CORE(fn)                                                                                   \
-    fn = reinterpret_cast<decltype(&::fn)>(get_proc(#fn));                                                           \
+#define CONDUIT_GLES_LOAD_CORE(fn)                                                                                     \
+    fn = reinterpret_cast<decltype(&::fn)>(get_proc(#fn));                                                             \
     ok = ok && fn != nullptr;
             CONDUIT_GLES_CORE(CONDUIT_GLES_LOAD_CORE)
 #undef CONDUIT_GLES_LOAD_CORE

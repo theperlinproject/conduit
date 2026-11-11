@@ -149,8 +149,7 @@ namespace conduit::gles {
     }
 
     void device::drain_errors() {
-        for (int i = 0; i < 16 && gl_.glGetError() != GL_NO_ERROR; i++) {
-        }
+        for (int i = 0; i < 16 && gl_.glGetError() != GL_NO_ERROR; i++) {}
     }
 
     bool device::query_features(std::string& error) {
@@ -178,10 +177,12 @@ namespace conduit::gles {
         features_.compute = level >= 31 && gl_.glDispatchCompute && gl_.glMemoryBarrier;
         features_.indirect = level >= 31 && gl_.glDrawElementsIndirect;
         features_.storage_images = level >= 31 && gl_.glBindImageTexture && gl_.glMemoryBarrier;
-        features_.indexed_blend = (level >= 32 || ext("GL_EXT_draw_buffers_indexed") || ext("GL_OES_draw_buffers_indexed")) &&
-                                  gl_.glBlendFuncSeparatei && gl_.glBlendEquationSeparatei && gl_.glColorMaski &&
-                                  gl_.glEnablei && gl_.glDisablei;
-        features_.copy_image = (level >= 32 || ext("GL_EXT_copy_image") || ext("GL_OES_copy_image")) && gl_.glCopyImageSubData;
+        features_.indexed_blend =
+            (level >= 32 || ext("GL_EXT_draw_buffers_indexed") || ext("GL_OES_draw_buffers_indexed")) &&
+            gl_.glBlendFuncSeparatei && gl_.glBlendEquationSeparatei && gl_.glColorMaski && gl_.glEnablei &&
+            gl_.glDisablei;
+        features_.copy_image =
+            (level >= 32 || ext("GL_EXT_copy_image") || ext("GL_OES_copy_image")) && gl_.glCopyImageSubData;
         features_.debug_groups = (level >= 32 || ext("GL_KHR_debug")) && gl_.glPushDebugGroup && gl_.glPopDebugGroup;
         features_.color_float = ext("GL_EXT_color_buffer_float");
         features_.half_float_color = features_.color_float || ext("GL_EXT_color_buffer_half_float");
@@ -191,7 +192,8 @@ namespace conduit::gles {
         features_.s3tc = ext("GL_EXT_texture_compression_s3tc");
         features_.bptc = ext("GL_EXT_texture_compression_bptc");
         features_.norm16 = ext("GL_EXT_texture_norm16");
-        features_.border_clamp = level >= 32 || ext("GL_EXT_texture_border_clamp") || ext("GL_OES_texture_border_clamp");
+        features_.border_clamp =
+            level >= 32 || ext("GL_EXT_texture_border_clamp") || ext("GL_OES_texture_border_clamp");
         features_.map_range = gl_.glMapBufferRange && gl_.glUnmapBuffer;
         features_.vsync_off = context_->can_disable_vsync();
         return true;
@@ -226,10 +228,12 @@ namespace conduit::gles {
         l.max_color_targets = static_cast<uint32_t>(
             std::clamp(std::min(integer(GL_MAX_COLOR_ATTACHMENTS, 4), integer(GL_MAX_DRAW_BUFFERS, 4)), 1, 8));
         l.max_msaa_samples = static_cast<uint32_t>(std::max(integer(GL_MAX_SAMPLES, 1), 1));
-        l.uniform_buffer_alignment = static_cast<uint32_t>(std::max(integer(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, 256), 1));
+        l.uniform_buffer_alignment =
+            static_cast<uint32_t>(std::max(integer(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, 256), 1));
         l.storage_buffer_alignment =
-            features_.compute ? static_cast<uint32_t>(std::max(integer(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, 256), 1))
-                              : 256u;
+            features_.compute
+                ? static_cast<uint32_t>(std::max(integer(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, 256), 1))
+                : 256u;
         l.copy_row_pitch_alignment = 4;
         l.copy_offset_alignment = 4;
         l.max_buffer_size = 1ull << 30;
@@ -255,7 +259,8 @@ namespace conduit::gles {
             const format_info& info = get_format_info(fmt);
             const format_gl& g = format_of(fmt);
             format_use use = format_use::sampled;
-            const bool wide_float = info.floating && info.bytes_per_block / std::max<uint8_t>(info.channels, 1) == 4 && !info.depth;
+            const bool wide_float =
+                info.floating && info.bytes_per_block / std::max<uint8_t>(info.channels, 1) == 4 && !info.depth;
             if (!g.integer && !info.depth && !info.compressed && (!wide_float || features_.float_linear))
                 use = use | format_use::sampled_linear;
             if (info.compressed)
@@ -267,7 +272,8 @@ namespace conduit::gles {
                 bool blendable = !g.integer;
                 if (info.floating) {
                     renderable = wide_float ? features_.color_float
-                                            : (fmt == format::r11g11b10_float ? features_.half_float_color : features_.half_float_color);
+                                            : (fmt == format::r11g11b10_float ? features_.half_float_color
+                                                                              : features_.half_float_color);
                     if (fmt == format::rgb32_float)
                         renderable = false;
                     if (wide_float)
@@ -468,7 +474,8 @@ namespace conduit::gles {
             } else {
                 gl_.glGenTextures(1, &t.gl);
                 use_texture(scratch_unit(), t.target, t.gl);
-                const GLsizei levels = static_cast<GLsizei>(std::min(t.desc.mips, mip_levels_for(t.desc.width, t.desc.height)));
+                const GLsizei levels =
+                    static_cast<GLsizei>(std::min(t.desc.mips, mip_levels_for(t.desc.width, t.desc.height)));
                 if (t.target == GL_TEXTURE_3D || t.target == GL_TEXTURE_2D_ARRAY)
                     gl_.glTexStorage3D(t.target, levels, t.fmt.internal, static_cast<GLsizei>(t.desc.width),
                                        static_cast<GLsizei>(t.desc.height),
@@ -521,14 +528,18 @@ namespace conduit::gles {
                     min_filter = mip_nearest ? GL_LINEAR_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR;
                 gl_.glSamplerParameteri(id, GL_TEXTURE_MIN_FILTER, static_cast<GLint>(min_filter));
                 gl_.glSamplerParameteri(id, GL_TEXTURE_MAG_FILTER, static_cast<GLint>(mag(desc.mag)));
-                gl_.glSamplerParameteri(id, GL_TEXTURE_WRAP_S, static_cast<GLint>(wrap_of(desc.u, features_.border_clamp)));
-                gl_.glSamplerParameteri(id, GL_TEXTURE_WRAP_T, static_cast<GLint>(wrap_of(desc.v, features_.border_clamp)));
-                gl_.glSamplerParameteri(id, GL_TEXTURE_WRAP_R, static_cast<GLint>(wrap_of(desc.w, features_.border_clamp)));
+                gl_.glSamplerParameteri(id, GL_TEXTURE_WRAP_S,
+                                        static_cast<GLint>(wrap_of(desc.u, features_.border_clamp)));
+                gl_.glSamplerParameteri(id, GL_TEXTURE_WRAP_T,
+                                        static_cast<GLint>(wrap_of(desc.v, features_.border_clamp)));
+                gl_.glSamplerParameteri(id, GL_TEXTURE_WRAP_R,
+                                        static_cast<GLint>(wrap_of(desc.w, features_.border_clamp)));
                 gl_.glSamplerParameterf(id, GL_TEXTURE_MIN_LOD, desc.min_lod);
                 gl_.glSamplerParameterf(id, GL_TEXTURE_MAX_LOD, std::min(desc.max_lod, 1000.0f));
                 if (desc.compare) {
                     gl_.glSamplerParameteri(id, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
-                    gl_.glSamplerParameteri(id, GL_TEXTURE_COMPARE_FUNC, static_cast<GLint>(compare_of(desc.compare_op)));
+                    gl_.glSamplerParameteri(id, GL_TEXTURE_COMPARE_FUNC,
+                                            static_cast<GLint>(compare_of(desc.compare_op)));
                 }
                 if (features_.anisotropy && !nearest && desc.max_anisotropy > 1.0f)
                     gl_.glSamplerParameterf(id, GL_TEXTURE_MAX_ANISOTROPY_EXT,
@@ -820,9 +831,10 @@ namespace conduit::gles {
         counters_.count_submit();
         std::vector<fence_op> waits(desc.waits.begin(), desc.waits.end());
         std::vector<fence_op> signals(desc.signals.begin(), desc.signals.end());
-        thread_.post([this, streams = std::move(streams), waits = std::move(waits), signals = std::move(signals)]() mutable {
-            execute(std::move(streams), std::move(waits), std::move(signals));
-        });
+        thread_.post(
+            [this, streams = std::move(streams), waits = std::move(waits), signals = std::move(signals)]() mutable {
+                execute(std::move(streams), std::move(waits), std::move(signals));
+            });
     }
 
     void device::execute(std::vector<std::vector<uint8_t>> streams, std::vector<fence_op> waits,

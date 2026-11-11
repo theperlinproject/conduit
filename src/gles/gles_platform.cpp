@@ -74,7 +74,8 @@ namespace conduit::gles {
 
         EM_JS(int, conduit_gles_probe, (char* vendor, char* renderer, int capacity), {
             try {
-                var canvas = typeof document !== 'undefined' ? document.createElement('canvas') : new OffscreenCanvas(1, 1);
+                var canvas =
+                    typeof document != = 'undefined' ? document.createElement('canvas') : new OffscreenCanvas(1, 1);
                 var gl = canvas.getContext('webgl2');
                 if (!gl)
                     return 0;
@@ -201,24 +202,24 @@ namespace conduit::gles {
     }
 #else
     namespace {
-#define CONDUIT_EGL_FUNCTIONS(X)                                                                                     \
-    X(eglGetProcAddress)                                                                                             \
-    X(eglGetDisplay)                                                                                                 \
-    X(eglInitialize)                                                                                                 \
-    X(eglTerminate)                                                                                                  \
-    X(eglBindAPI)                                                                                                    \
-    X(eglChooseConfig)                                                                                               \
-    X(eglGetConfigAttrib)                                                                                            \
-    X(eglCreateContext)                                                                                              \
-    X(eglDestroyContext)                                                                                             \
-    X(eglCreateWindowSurface)                                                                                        \
-    X(eglCreatePbufferSurface)                                                                                       \
-    X(eglDestroySurface)                                                                                             \
-    X(eglMakeCurrent)                                                                                                \
-    X(eglSwapBuffers)                                                                                                \
-    X(eglSwapInterval)                                                                                               \
-    X(eglQuerySurface)                                                                                               \
-    X(eglQueryString)                                                                                                \
+#define CONDUIT_EGL_FUNCTIONS(X)                                                                                       \
+    X(eglGetProcAddress)                                                                                               \
+    X(eglGetDisplay)                                                                                                   \
+    X(eglInitialize)                                                                                                   \
+    X(eglTerminate)                                                                                                    \
+    X(eglBindAPI)                                                                                                      \
+    X(eglChooseConfig)                                                                                                 \
+    X(eglGetConfigAttrib)                                                                                              \
+    X(eglCreateContext)                                                                                                \
+    X(eglDestroyContext)                                                                                               \
+    X(eglCreateWindowSurface)                                                                                          \
+    X(eglCreatePbufferSurface)                                                                                         \
+    X(eglDestroySurface)                                                                                               \
+    X(eglMakeCurrent)                                                                                                  \
+    X(eglSwapBuffers)                                                                                                  \
+    X(eglSwapInterval)                                                                                                 \
+    X(eglQuerySurface)                                                                                                 \
+    X(eglQueryString)                                                                                                  \
     X(eglGetError)
 
         struct egl_api {
@@ -278,8 +279,8 @@ namespace conduit::gles {
                 if (!out.egl || !out.gles)
                     return out;
                 bool ok = true;
-#define CONDUIT_EGL_LOAD(fn)                                                                                         \
-    out.api.fn = reinterpret_cast<decltype(&::fn)>(find_symbol(out.egl, #fn));                                       \
+#define CONDUIT_EGL_LOAD(fn)                                                                                           \
+    out.api.fn = reinterpret_cast<decltype(&::fn)>(find_symbol(out.egl, #fn));                                         \
     ok = ok && out.api.fn != nullptr;
                 CONDUIT_EGL_FUNCTIONS(CONDUIT_EGL_LOAD)
 #undef CONDUIT_EGL_LOAD
@@ -347,7 +348,8 @@ namespace conduit::gles {
                     display_ = EGL_NO_DISPLAY;
                     return false;
                 }
-                extensions_ = egl.eglQueryString(display_, EGL_EXTENSIONS) ? egl.eglQueryString(display_, EGL_EXTENSIONS) : "";
+                extensions_ =
+                    egl.eglQueryString(display_, EGL_EXTENSIONS) ? egl.eglQueryString(display_, EGL_EXTENSIONS) : "";
                 if (!egl.eglBindAPI(EGL_OPENGL_ES_API)) {
                     error = "eglBindAPI(OpenGL ES) failed";
                     return false;
@@ -436,9 +438,22 @@ namespace conduit::gles {
 #endif
                 for (const EGLint renderable : {EGL_OPENGL_ES3_BIT, EGL_OPENGL_ES2_BIT}) {
                     for (const EGLint surface_types : {EGL_WINDOW_BIT | EGL_PBUFFER_BIT, EGL_WINDOW_BIT}) {
-                        const EGLint attributes[] = {EGL_SURFACE_TYPE, surface_types, EGL_RENDERABLE_TYPE, renderable,
-                                                     EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
-                                                     EGL_ALPHA_SIZE, alpha, EGL_DEPTH_SIZE, 0, EGL_STENCIL_SIZE, 0,
+                        const EGLint attributes[] = {EGL_SURFACE_TYPE,
+                                                     surface_types,
+                                                     EGL_RENDERABLE_TYPE,
+                                                     renderable,
+                                                     EGL_RED_SIZE,
+                                                     8,
+                                                     EGL_GREEN_SIZE,
+                                                     8,
+                                                     EGL_BLUE_SIZE,
+                                                     8,
+                                                     EGL_ALPHA_SIZE,
+                                                     alpha,
+                                                     EGL_DEPTH_SIZE,
+                                                     0,
+                                                     EGL_STENCIL_SIZE,
+                                                     0,
                                                      EGL_NONE};
                         EGLint count = 0;
                         if (egl.eglChooseConfig(display_, attributes, &config_, 1, &count) && count > 0)
@@ -538,7 +553,8 @@ namespace conduit::gles {
                     delete w;
                     return nullptr;
                 }
-                const auto create = reinterpret_cast<wl_egl_window_create_fn>(find_symbol(w->lib, "wl_egl_window_create"));
+                const auto create =
+                    reinterpret_cast<wl_egl_window_create_fn>(find_symbol(w->lib, "wl_egl_window_create"));
                 w->resize = reinterpret_cast<wl_egl_window_resize_fn>(find_symbol(w->lib, "wl_egl_window_resize"));
                 w->destroy = reinterpret_cast<wl_egl_window_destroy_fn>(find_symbol(w->lib, "wl_egl_window_destroy"));
                 if (!create || !(w->window = create(window.window, static_cast<int>(std::max(width, 1u)),
@@ -560,9 +576,21 @@ namespace conduit::gles {
             if (surface == EGL_NO_SURFACE) {
                 EGLConfig configs[64];
                 EGLint count = 0;
-                const EGLint attributes[] = {EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-                                             EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_DEPTH_SIZE,
-                                             0, EGL_STENCIL_SIZE, 0, EGL_NONE};
+                const EGLint attributes[] = {EGL_SURFACE_TYPE,
+                                             EGL_WINDOW_BIT,
+                                             EGL_RENDERABLE_TYPE,
+                                             EGL_OPENGL_ES3_BIT,
+                                             EGL_RED_SIZE,
+                                             8,
+                                             EGL_GREEN_SIZE,
+                                             8,
+                                             EGL_BLUE_SIZE,
+                                             8,
+                                             EGL_DEPTH_SIZE,
+                                             0,
+                                             EGL_STENCIL_SIZE,
+                                             0,
+                                             EGL_NONE};
                 if (egl.eglChooseConfig(display_, attributes, configs, 64, &count))
                     for (EGLint i = 0; i < count && surface == EGL_NO_SURFACE; i++)
                         surface = egl.eglCreateWindowSurface(display_, configs[i], native, nullptr);

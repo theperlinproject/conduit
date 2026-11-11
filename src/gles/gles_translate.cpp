@@ -116,7 +116,8 @@ namespace conduit::gles {
                 out.uniform_blocks.push_back({name, layout.push_slot});
                 out.uses_push = true;
                 out.push_bytes = std::max<uint32_t>(
-                    out.push_bytes, static_cast<uint32_t>(compiler.get_declared_struct_size(compiler.get_type(pc.base_type_id))));
+                    out.push_bytes,
+                    static_cast<uint32_t>(compiler.get_declared_struct_size(compiler.get_type(pc.base_type_id))));
             }
 
             for (const sc::Resource& sb : resources.storage_buffers) {
@@ -126,7 +127,8 @@ namespace conduit::gles {
                 }
                 uint32_t set = 0, binding = 0;
                 const layout_slot* slot = slot_of(sb, set, binding);
-                if (!slot || (slot->type != binding_type::storage_buffer && slot->type != binding_type::storage_buffer_rw))
+                if (!slot ||
+                    (slot->type != binding_type::storage_buffer && slot->type != binding_type::storage_buffer_rw))
                     return missing("a storage buffer", set, binding);
                 compiler.set_decoration(sb.id, spv::DecorationBinding, slot->index);
                 compiler.unset_decoration(sb.id, spv::DecorationDescriptorSet);
@@ -251,10 +253,12 @@ namespace conduit::gles {
             // before ES 3.1 the stages meet by name rather than by location, so a varying is named after its location
             if (stage == shader_stage::vertex)
                 for (const sc::Resource& r : resources.stage_outputs)
-                    compiler.set_name(r.id, "cdt_v" + std::to_string(compiler.get_decoration(r.id, spv::DecorationLocation)));
+                    compiler.set_name(r.id,
+                                      "cdt_v" + std::to_string(compiler.get_decoration(r.id, spv::DecorationLocation)));
             if (stage == shader_stage::fragment)
                 for (const sc::Resource& r : resources.stage_inputs)
-                    compiler.set_name(r.id, "cdt_v" + std::to_string(compiler.get_decoration(r.id, spv::DecorationLocation)));
+                    compiler.set_name(r.id,
+                                      "cdt_v" + std::to_string(compiler.get_decoration(r.id, spv::DecorationLocation)));
 
             out.glsl = compiler.compile();
             return true;

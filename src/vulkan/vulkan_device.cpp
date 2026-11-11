@@ -176,10 +176,9 @@ namespace conduit::vk {
         const bool ext_f16 = !api12 && phys_.has(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
         const bool ext_indexing = !api12 && phys_.has(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
         const bool ext_count = !api12 && phys_.has(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
-        const bool ext_render =
-            !api13 && phys_.has(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) &&
-            (api12 || (phys_.has(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME) &&
-                       phys_.has(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME)));
+        const bool ext_render = !api13 && phys_.has(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) &&
+                                (api12 || (phys_.has(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME) &&
+                                           phys_.has(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME)));
         const bool ext_sync2 = !api13 && phys_.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
 
         VkPhysicalDeviceFeatures2 sup2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -190,7 +189,8 @@ namespace conduit::vk {
         VkPhysicalDeviceBufferDeviceAddressFeatures sup_bda{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
         VkPhysicalDeviceHostQueryResetFeatures sup_reset{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES};
-        VkPhysicalDeviceShaderFloat16Int8Features sup_f16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
+        VkPhysicalDeviceShaderFloat16Int8Features sup_f16{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
         VkPhysicalDeviceDescriptorIndexingFeatures sup_indexing{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
         VkPhysicalDeviceDynamicRenderingFeaturesKHR sup_dr{
@@ -253,7 +253,8 @@ namespace conduit::vk {
         VkPhysicalDeviceBufferDeviceAddressFeatures en_bda{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
         VkPhysicalDeviceHostQueryResetFeatures en_reset{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES};
-        VkPhysicalDeviceShaderFloat16Int8Features en_f16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
+        VkPhysicalDeviceShaderFloat16Int8Features en_f16{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
         VkPhysicalDeviceDescriptorIndexingFeatures en_indexing{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
         VkPhysicalDeviceDynamicRenderingFeaturesKHR en_dr{
@@ -2023,8 +2024,9 @@ namespace conduit::vk {
         auto expired = [&] {
             if (timeout_ns == ~0ull)
                 return false;
-            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start)
-                                             .count()) >= timeout_ns;
+            return static_cast<uint64_t>(
+                       std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count()) >=
+                   timeout_ns;
         };
         for (;;) {
             std::shared_ptr<pooled_fence> fence;
@@ -2093,8 +2095,8 @@ namespace conduit::vk {
             src |= legacy_stages(b.srcStageMask);
             dst |= legacy_stages(b.dstStageMask);
             buffers.push_back({VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr, legacy_access(b.srcAccessMask),
-                               legacy_access(b.dstAccessMask), b.srcQueueFamilyIndex, b.dstQueueFamilyIndex,
-                               b.buffer, b.offset, b.size});
+                               legacy_access(b.dstAccessMask), b.srcQueueFamilyIndex, b.dstQueueFamilyIndex, b.buffer,
+                               b.offset, b.size});
         }
         for (uint32_t i = 0; i < info.imageMemoryBarrierCount; i++) {
             const VkImageMemoryBarrier2& b = info.pImageMemoryBarriers[i];
@@ -2108,8 +2110,7 @@ namespace conduit::vk {
             src = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         if (!dst)
             dst = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
-        fn_.vkCmdPipelineBarrier(cmd, src, dst, 0,
-                                 static_cast<uint32_t>(memory.size()), memory.data(),
+        fn_.vkCmdPipelineBarrier(cmd, src, dst, 0, static_cast<uint32_t>(memory.size()), memory.data(),
                                  static_cast<uint32_t>(buffers.size()), buffers.data(),
                                  static_cast<uint32_t>(images.size()), images.data());
     }

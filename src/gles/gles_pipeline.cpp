@@ -356,10 +356,9 @@ namespace conduit::gles {
             if (!features_.indexed_blend)
                 for (uint32_t i = 1; i < p.color_count; i++)
                     if (!(st.blend[i] == st.blend[0]))
-                        report_once("OpenGL ES " + std::to_string(features_.major) + "." +
-                                    std::to_string(features_.minor) +
-                                    " blends every color target the same way: using the state of target 0 (" +
-                                    label + ")");
+                        report_once(
+                            "OpenGL ES " + std::to_string(features_.major) + "." + std::to_string(features_.minor) +
+                            " blends every color target the same way: using the state of target 0 (" + label + ")");
             p.stream_count = std::min(graphics->stream_count, max_vertex_streams);
             p.streams = graphics->streams;
             p.attribute_count = std::min(graphics->attribute_count, max_vertex_attributes);

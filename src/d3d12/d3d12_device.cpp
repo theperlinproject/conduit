@@ -1066,7 +1066,8 @@ namespace conduit::d3d12 {
         wprops->GetWorkGraphMemoryRequirements(index, &mem);
         if (mem.MaxSizeInBytes) {
             // the most the driver can use: it schedules better with room, and a culling graph is small
-            const uint64_t size = (std::max<uint64_t>)(mem.MinSizeInBytes, (std::min<uint64_t>)(mem.MaxSizeInBytes, 64ull << 20));
+            const uint64_t size =
+                (std::max<uint64_t>)(mem.MinSizeInBytes, (std::min<uint64_t>)(mem.MaxSizeInBytes, 64ull << 20));
             D3D12_HEAP_PROPERTIES heap{};
             heap.Type = D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC rd{};
@@ -1078,8 +1079,8 @@ namespace conduit::d3d12 {
             rd.SampleDesc.Count = 1;
             rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-            hr = device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                  winrt::guid_of<ID3D12Resource>(), rec.backing.put_void());
+            hr = device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                  nullptr, winrt::guid_of<ID3D12Resource>(), rec.backing.put_void());
             if (FAILED(hr)) {
                 report_error("CreateWorkGraph: backing memory allocation failed");
                 return {};

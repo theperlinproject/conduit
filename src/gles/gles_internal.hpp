@@ -286,13 +286,13 @@ namespace conduit::gles {
     struct gl_features {
         uint32_t major = 3, minor = 0;
         uint32_t glsl_version = 300;
-        bool compute = false;           // ES 3.1
-        bool indirect = false;          // ES 3.1
-        bool storage_images = false;    // ES 3.1
-        bool indexed_blend = false;     // ES 3.2 or EXT_draw_buffers_indexed
-        bool copy_image = false;        // ES 3.2 or EXT_copy_image
+        bool compute = false;        // ES 3.1
+        bool indirect = false;       // ES 3.1
+        bool storage_images = false; // ES 3.1
+        bool indexed_blend = false;  // ES 3.2 or EXT_draw_buffers_indexed
+        bool copy_image = false;     // ES 3.2 or EXT_copy_image
         bool debug_groups = false;
-        bool color_float = false;       // 32-bit float color attachments
+        bool color_float = false; // 32-bit float color attachments
         bool half_float_color = false;
         bool float_blend = false;
         bool float_linear = false;

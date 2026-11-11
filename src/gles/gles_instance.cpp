@@ -48,8 +48,9 @@ namespace conduit::gles {
             void present() override {
                 if (images_.empty())
                     return;
-                device_.thread().post(
-                    [this, texture = images_[current_], mode = mode_] { device_.present_texture(texture, *surface_, mode); });
+                device_.thread().post([this, texture = images_[current_], mode = mode_] {
+                    device_.present_texture(texture, *surface_, mode);
+                });
             }
 
             bool resize(uint32_t width, uint32_t height) override {
@@ -146,7 +147,8 @@ namespace conduit::gles {
                 a.name = info.renderer.empty() ? "OpenGL ES" : info.renderer;
                 a.vendor_id = vendor_from(info.vendor, info.renderer);
                 std::string lower = info.renderer;
-                std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+                std::transform(lower.begin(), lower.end(), lower.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
                 const bool software = lower.find("llvmpipe") != std::string::npos ||
                                       lower.find("swiftshader") != std::string::npos ||
                                       lower.find("softpipe") != std::string::npos;
