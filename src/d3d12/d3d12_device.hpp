@@ -304,6 +304,7 @@ namespace conduit::d3d12 {
         pipeline_rec pipeline_;
         pipeline_layout_handle layout_handle_;
         bool have_pipeline_ = false;
+        pipeline_handle pipeline_handle_{}; // the handle pipeline_ came from, for the same-pipeline early out
         bool pipeline_pending_ = false;
         bool in_rendering_ = false;
         bool pass_broken_ = false;

@@ -94,6 +94,9 @@ namespace conduit::d3d12 {
         vertex_dirty_ = 0;
         vbuffers_ = {};
         index_view_ = {};
+        // a reset native list has no viewport or scissor: the redundancy checks must not skip the first set
+        have_viewport_ = have_scissor_ = false;
+        pipeline_handle_ = {};
         pending_resolves_.clear();
         heaps_set_ = false;
         invalid_ = false;
@@ -498,6 +501,9 @@ namespace conduit::d3d12 {
     }
 
     void cmd_list::set_pipeline(pipeline_handle handle) {
+        // the same ready pipeline again: nothing to do (no record copy, no reference counting)
+        if (have_pipeline_ && !invalid_ && !pass_broken_ && handle == pipeline_handle_)
+            return;
         pipeline_rec* p = device_.pipelines_.get(handle);
         if (!p) {
             fail("SetPipeline: unknown pipeline");
@@ -523,6 +529,7 @@ namespace conduit::d3d12 {
         pipeline_.build.reset();
         layout_handle_ = p->layout_handle;
         have_pipeline_ = true;
+        pipeline_handle_ = handle;
         if (pso)
             list_->SetPipelineState(pso.get());
         if (!p->compute)
@@ -581,13 +588,19 @@ namespace conduit::d3d12 {
     }
 
     void cmd_list::set_viewport(const viewport& v) {
-        viewport_ = {v.x, v.y, v.width, v.height, v.min_depth, v.max_depth};
+        const D3D12_VIEWPORT next = {v.x, v.y, v.width, v.height, v.min_depth, v.max_depth};
+        if (have_viewport_ && !invalid_ && std::memcmp(&next, &viewport_, sizeof(next)) == 0)
+            return;
+        viewport_ = next;
         have_viewport_ = true;
         list_->RSSetViewports(1, &viewport_);
     }
 
     void cmd_list::set_scissor(const rect& r) {
-        scissor_ = {r.x, r.y, r.x + static_cast<LONG>(r.width), r.y + static_cast<LONG>(r.height)};
+        const D3D12_RECT next = {r.x, r.y, r.x + static_cast<LONG>(r.width), r.y + static_cast<LONG>(r.height)};
+        if (have_scissor_ && !invalid_ && std::memcmp(&next, &scissor_, sizeof(next)) == 0)
+            return;
+        scissor_ = next;
         have_scissor_ = true;
         list_->RSSetScissorRects(1, &scissor_);
     }
@@ -600,8 +613,13 @@ namespace conduit::d3d12 {
         }
         if (device_.use_validator_)
             device_.validator_.expect_buffer(buffer, state::vertex_buffer, "SetVertexBuffer");
-        vbuffers_[slot].BufferLocation = b->address + offset;
-        vbuffers_[slot].SizeInBytes = static_cast<UINT>(b->desc.size - offset);
+        const D3D12_GPU_VIRTUAL_ADDRESS location = b->address + offset;
+        const UINT size = static_cast<UINT>(b->desc.size - offset);
+        if ((vertex_mask_ & (1u << slot)) && vbuffers_[slot].BufferLocation == location &&
+            vbuffers_[slot].SizeInBytes == size)
+            return;
+        vbuffers_[slot].BufferLocation = location;
+        vbuffers_[slot].SizeInBytes = size;
         vertex_mask_ |= 1u << slot;
         vertex_dirty_ |= 1u << slot;
     }
@@ -614,9 +632,12 @@ namespace conduit::d3d12 {
         }
         if (device_.use_validator_)
             device_.validator_.expect_buffer(buffer, state::index_buffer, "SetIndexBuffer");
-        index_view_.BufferLocation = b->address + offset;
-        index_view_.SizeInBytes = static_cast<UINT>(b->desc.size - offset);
-        index_view_.Format = type == index_type::u16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
+        const D3D12_INDEX_BUFFER_VIEW next = {b->address + offset, static_cast<UINT>(b->desc.size - offset),
+                                              type == index_type::u16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
+        if (have_index_ && !invalid_ && next.BufferLocation == index_view_.BufferLocation &&
+            next.SizeInBytes == index_view_.SizeInBytes && next.Format == index_view_.Format)
+            return;
+        index_view_ = next;
         have_index_ = true;
         list_->IASetIndexBuffer(&index_view_);
     }

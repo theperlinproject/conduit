@@ -596,9 +596,12 @@ namespace conduit::vk {
         }
         if (device_.use_validator_)
             device_.validator_.expect_buffer(buffer, state::index_buffer, "SetIndexBuffer");
+        const VkIndexType kind = type == index_type::u16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+        if (have_index_ && !invalid_ && ibuffer_ == b->buffer && ioffset_ == offset && itype_ == kind)
+            return;
         ibuffer_ = b->buffer;
         ioffset_ = offset;
-        itype_ = type == index_type::u16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+        itype_ = kind;
         have_index_ = true;
         device_.fn_.vkCmdBindIndexBuffer(cmd_, ibuffer_, offset, itype_);
     }

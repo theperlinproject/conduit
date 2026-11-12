@@ -4,6 +4,7 @@ on:
   push:
   pull_request:
 
+# a newer push to the same branch cancels the older run, so stale runs never hold the org's runner slots
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
