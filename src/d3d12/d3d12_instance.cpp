@@ -476,11 +476,26 @@ namespace conduit::d3d12 {
             return;
         removal_reported_ = true;
 #if defined(__ID3D12DeviceRemovedExtendedData1_INTERFACE_DEFINED__)
-        static const char* const ops[] = {"SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced",
-                                          "ExecuteIndirect", "Dispatch", "CopyBufferRegion", "CopyTextureRegion",
-                                          "CopyResource", "CopyTiles", "ResolveSubresource", "ClearRenderTargetView",
-                                          "ClearUnorderedAccessView", "ClearDepthStencilView", "ResourceBarrier",
-                                          "ExecuteBundle", "Present", "ResolveQueryData", "BeginSubmission",
+        static const char* const ops[] = {"SetMarker",
+                                          "BeginEvent",
+                                          "EndEvent",
+                                          "DrawInstanced",
+                                          "DrawIndexedInstanced",
+                                          "ExecuteIndirect",
+                                          "Dispatch",
+                                          "CopyBufferRegion",
+                                          "CopyTextureRegion",
+                                          "CopyResource",
+                                          "CopyTiles",
+                                          "ResolveSubresource",
+                                          "ClearRenderTargetView",
+                                          "ClearUnorderedAccessView",
+                                          "ClearDepthStencilView",
+                                          "ResourceBarrier",
+                                          "ExecuteBundle",
+                                          "Present",
+                                          "ResolveQueryData",
+                                          "BeginSubmission",
                                           "EndSubmission"};
         winrt::com_ptr<ID3D12DeviceRemovedExtendedData1> data;
         if (FAILED(device_->QueryInterface(winrt::guid_of<ID3D12DeviceRemovedExtendedData1>(), data.put_void()))) {
@@ -500,7 +515,8 @@ namespace conduit::d3d12 {
                 const UINT from = done > 6 ? done - 6 : 0;
                 for (UINT i = from; i < std::min<UINT>(n->BreadcrumbCount, done + 4); i++) {
                     const UINT op = static_cast<UINT>(n->pCommandHistory[i]);
-                    line += std::string(i == done ? " >>" : " ") + (op < sizeof(ops) / sizeof(ops[0]) ? ops[op] : "op" + std::to_string(op));
+                    line += std::string(i == done ? " >>" : " ") +
+                            (op < sizeof(ops) / sizeof(ops[0]) ? ops[op] : "op" + std::to_string(op));
                 }
                 std::fprintf(stderr, "%s\n", line.c_str());
             }

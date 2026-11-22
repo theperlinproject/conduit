@@ -210,10 +210,13 @@ static void test_real_probe() {
     std::printf("%s", p.explain().c_str());
     for (const candidate& c : probe.candidates)
         CHECK(c.adapter.api != api::none);
-    if (!probe.candidates.empty()) {
-        CHECK(p.api != api::none);
+    const bool any_usable = std::any_of(probe.candidates.begin(), probe.candidates.end(),
+                                        [](const candidate& c) { return c.adapter.usable; });
+    if (!any_usable) {
+        CHECK(p.api == api::none && p.fallbacks.empty());
+    } else if (p.api != api::none) {
         CHECK(p.device().adapter_index == p.adapter_index);
-        CHECK(!hardware_key(p.fallbacks.front().adapter, system).empty());
+        CHECK(!p.fallbacks.empty() && !hardware_key(p.fallbacks.front().adapter, system).empty());
     }
 }
 

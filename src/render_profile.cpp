@@ -578,8 +578,8 @@ namespace conduit {
                                !parallel         ? "this api records on one thread"
                                : fast_cores == 0 ? "core count unknown: one recording thread"
                                : threads > 1     ? std::to_string(threads) + " lists at once, at least " +
-                                                       std::to_string(p.min_draws_per_list) + " draws each"
-                                                 : "too few cores or draws for a second list to pay for itself"});
+                                                   std::to_string(p.min_draws_per_list) + " draws each"
+                                             : "too few cores or draws for a second list to pay for itself"});
 
         const bool off_thread = compiles_pipelines_off_thread(p.api);
         p.async_pipelines =
@@ -600,9 +600,10 @@ namespace conduit {
         if (load == workload::texture_heavy)
             p.upload_ring_bytes *= 2;
         if (constrained)
-            p.upload_ring_bytes = (std::min)(p.upload_ring_bytes, 16ull << 20);
+            p.upload_ring_bytes = (std::min)(p.upload_ring_bytes, uint64_t{16} << 20);
         if (p.memory_budget_bytes)
-            p.upload_ring_bytes = (std::min)(p.upload_ring_bytes, (std::max)(p.memory_budget_bytes / 32, 4ull << 20));
+            p.upload_ring_bytes =
+                (std::min)(p.upload_ring_bytes, (std::max)(p.memory_budget_bytes / 32, uint64_t{4} << 20));
 
         if (user.allow_upscaling && p.tier >= tier::low) {
             if (adapter.vendor_id == vendor_id::nvidia && p.api != api::d3d11 && p.api != api::gles)
