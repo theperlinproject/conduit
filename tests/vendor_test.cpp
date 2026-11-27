@@ -1,3 +1,4 @@
+#include <conduit/render_profile.hpp>
 #include <conduit/vendor.hpp>
 
 #include <cmath>
@@ -53,6 +54,39 @@ int main() {
     auto session = vendor::session::begin(api::vulkan, {}, hooks, &log);
     CHECK(session == nullptr);
     CHECK(!log.empty());
+
+    CHECK(quality_for(1.0f) == quality::native);
+    CHECK(quality_for(0.75f) == quality::ultra_quality);
+    CHECK(quality_for(0.667f) == quality::quality);
+    CHECK(quality_for(0.55f) == quality::balanced);
+    CHECK(quality_for(0.5f) == quality::performance);
+    CHECK(quality_for(0.2f) == quality::ultra_performance);
+    for (float s = 0.3f; s <= 1.0f; s += 0.05f)
+        CHECK(scale_of(quality_for(s)) + 0.005f >= s);
+
+    // a session is only worth starting where the sdk serves the gpu
+    render_profile p;
+    p.api = api::d3d12;
+    p.fallbacks.emplace_back();
+    p.fallbacks[0].adapter.vendor_id = vendor_id::nvidia;
+    p.upscalers = {conduit::upscaler::dlss, conduit::upscaler::native};
+    p.frame_generation = true;
+    session_request r = request_for(p);
+    CHECK(r.upscaler && r.frame_generation && r.low_latency);
+    p.frame_generation = false;
+    p.workload = workload::low_latency;
+    r = request_for(p);
+    CHECK(r.upscaler && !r.frame_generation && r.low_latency);
+    p.fallbacks[0].adapter.vendor_id = vendor_id::amd;
+    r = request_for(p);
+    CHECK(!r.upscaler && !r.frame_generation && !r.low_latency);
+    log.clear();
+    CHECK(vendor::session::begin(api::d3d12, r, hooks, &log) == nullptr);
+    CHECK(log.contains("no vendor feature"));
+    p.fallbacks[0].adapter.vendor_id = vendor_id::nvidia;
+    p.api = api::d3d11;
+    r = request_for(p);
+    CHECK(!r.upscaler && !r.low_latency);
 
     if (g_failed) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failed);

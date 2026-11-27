@@ -132,6 +132,9 @@
     X(glDispatchComputeIndirect, void, (GLintptr))                                                                     \
     X(glDrawElementsIndirect, void, (GLenum, GLenum, const void*))                                                     \
     X(glDrawArraysIndirect, void, (GLenum, const void*))                                                               \
+    X(glMultiDrawElementsIndirect, void, (GLenum, GLenum, const void*, GLsizei, GLsizei))                              \
+    X(glDrawElementsBaseVertex, void, (GLenum, GLsizei, GLenum, const void*, GLint))                                   \
+    X(glDrawElementsInstancedBaseVertex, void, (GLenum, GLsizei, GLenum, const void*, GLsizei, GLint))                 \
     X(glMemoryBarrier, void, (GLbitfield))                                                                             \
     X(glBindImageTexture, void, (GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum))                             \
     X(glCopyImageSubData, void,                                                                                        \

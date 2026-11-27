@@ -1,9 +1,11 @@
 #include "backends.hpp"
+#include "common/counters.hpp"
 #include "common/handle_pool.hpp"
 #include "common/retire_queue.hpp"
 #include "common/state_validator.hpp"
 #include "common/util.hpp"
 
+#include <atomic>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -19,8 +21,20 @@ namespace conduit {
         struct null_texture {
             texture_desc desc;
             std::string name;
-            std::vector<std::vector<std::vector<uint8_t>>> data;
+            // one block: every layer holds its mips back to back
+            std::vector<uint8_t> data;
+            std::vector<uint32_t> mip_offset;
+            uint32_t layer_bytes = 0;
             bool external = false;
+
+            std::span<uint8_t> mip(uint32_t layer, uint32_t level) {
+                const uint32_t begin = mip_offset[level];
+                const uint32_t end = level + 1 < mip_offset.size() ? mip_offset[level + 1] : layer_bytes;
+                return {data.data() + static_cast<size_t>(layer) * layer_bytes + begin, end - begin};
+            }
+            bool has(uint32_t layer, uint32_t level) const {
+                return level < mip_offset.size() && static_cast<size_t>(layer + 1) * layer_bytes <= data.size();
+            }
         };
 
         struct null_sampler {
@@ -37,7 +51,69 @@ namespace conduit {
             bind_layout_handle layout;
             std::vector<bind_group_entry> entries;
             std::vector<bind_layout_entry> layout_entries;
+            // what binding the group asks of each resource, worked out once since a group never changes
+            std::vector<state_validator::bound_resource> bound;
+            uint32_t dynamic_count = 0;
+            bool resolved = false;
+            // validator version at which every resource of the group was last found in the right state
+            std::atomic<uint64_t> passed{0};
+
+            null_bind_group() = default;
+            null_bind_group(null_bind_group&& o) noexcept
+                : layout(o.layout), entries(std::move(o.entries)), layout_entries(std::move(o.layout_entries)),
+                  bound(std::move(o.bound)), dynamic_count(o.dynamic_count), resolved(o.resolved) {}
+            null_bind_group& operator=(null_bind_group&& o) noexcept {
+                layout = o.layout;
+                entries = std::move(o.entries);
+                layout_entries = std::move(o.layout_entries);
+                bound = std::move(o.bound);
+                dynamic_count = o.dynamic_count;
+                resolved = o.resolved;
+                passed.store(0, std::memory_order_relaxed);
+                return *this;
+            }
         };
+        // what binding the group asks of each resource
+        void resolve_bound(const null_bind_group& g, std::vector<state_validator::bound_resource>& out) {
+            out.clear();
+            out.reserve(g.entries.size());
+            for (const bind_layout_entry& le : g.layout_entries) {
+                for (const bind_group_entry& e : g.entries) {
+                    if (e.binding != le.binding)
+                        continue;
+                    state_validator::bound_resource r;
+                    r.range = e.texture.range;
+                    switch (le.type) {
+                    case binding_type::sampled_texture:
+                        r.texture = e.texture.texture;
+                        r.want = state::shader_read | state::depth_read_sampled;
+                        break;
+                    case binding_type::storage_texture_rw:
+                        r.texture = e.texture.texture;
+                        r.want = state::shader_write;
+                        break;
+                    case binding_type::storage_buffer_rw:
+                        r.buffer = e.buffer.buffer;
+                        r.want = state::shader_write;
+                        break;
+                    case binding_type::storage_buffer:
+                        r.buffer = e.buffer.buffer;
+                        r.want = state::shader_read;
+                        break;
+                    case binding_type::uniform_buffer:
+                    case binding_type::uniform_buffer_dynamic:
+                        r.buffer = e.buffer.buffer;
+                        r.want = state::uniform_buffer;
+                        break;
+                    case binding_type::sampler:
+                        break;
+                    }
+                    if (r.texture || r.buffer)
+                        out.push_back(r);
+                }
+            }
+        }
+
         struct null_pipeline_layout {
             pipeline_layout_desc desc;
         };
@@ -62,11 +138,15 @@ namespace conduit {
             queue_type queue() const override { return queue_; }
             void reset() {
                 ops_.clear();
+                counters_ = {};
                 in_rendering_ = false;
                 pipeline_ = {};
                 bound_sets_ = {};
                 index_buffer_ = {};
                 vertex_buffers_ = {};
+                vertex_passed_ = {};
+                index_passed_ = 0;
+                draw_checked_ = false;
                 color_formats_.fill(format::unknown);
                 color_count_ = 0;
                 depth_format_ = format::unknown;
@@ -112,6 +192,7 @@ namespace conduit {
             void* native_handle() override { return nullptr; }
             void invalidate_bound_state() override {}
             int open_labels() const { return label_depth_; }
+            const list_counters& counters() const { return counters_; }
 
         private:
             void check_draw(const char* what);
@@ -131,6 +212,13 @@ namespace conduit {
             uint32_t color_count_ = 0;
             format depth_format_ = format::unknown;
             uint32_t push_bytes_set_ = 0;
+            list_counters counters_;
+            // a check that passed stays passed until the validator's version moves or the binding changes, so
+            // a stream of similar draws is validated once instead of once per draw
+            std::array<uint64_t, max_vertex_streams> vertex_passed_{};
+            uint64_t index_passed_ = 0;
+            bool draw_checked_ = false;
+            uint64_t draw_version_ = 0;
         };
 
         class null_swapchain;
@@ -180,24 +268,24 @@ namespace conduit {
             }
 
             texture_handle create_texture(const texture_desc& desc) override {
+                if (has(desc.usage, texture_usage::transient) &&
+                    (has(desc.usage, texture_usage::sampled) || has(desc.usage, texture_usage::storage) ||
+                     has(desc.usage, texture_usage::copy_src) || has(desc.usage, texture_usage::copy_dst) ||
+                     !(has(desc.usage, texture_usage::color_target) || has(desc.usage, texture_usage::depth_target))))
+                    report_device_error("CreateTexture: a transient texture is a render target and nothing else");
                 null_texture t;
                 t.desc = desc;
                 t.name = desc.name ? desc.name : "";
                 t.desc.mips = (std::max)(1u, desc.mips);
                 const uint32_t layers = layer_count_of(t.desc);
-                t.data.resize(layers);
-                uint64_t bytes = 0;
-                for (auto& layer : t.data) {
-                    layer.resize(t.desc.mips);
-                    for (uint32_t m = 0; m < t.desc.mips; m++) {
-                        const uint32_t w = mip_extent(desc.width, m), h = mip_extent(desc.height, m);
-                        layer[m].assign(static_cast<size_t>(row_bytes(desc.format, w)) * row_blocks(desc.format, h) *
-                                            depth_of(desc),
-                                        0);
-                        bytes += layer[m].size();
-                    }
+                t.mip_offset.resize(t.desc.mips);
+                for (uint32_t m = 0; m < t.desc.mips; m++) {
+                    const uint32_t w = mip_extent(desc.width, m), h = mip_extent(desc.height, m);
+                    t.mip_offset[m] = t.layer_bytes;
+                    t.layer_bytes += row_bytes(desc.format, w) * row_blocks(desc.format, h) * depth_of(desc);
                 }
-                stats_.texture_bytes += bytes;
+                t.data.assign(static_cast<size_t>(t.layer_bytes) * layers, 0);
+                stats_.texture_bytes += t.data.size();
                 stats_.live_textures++;
                 texture_handle h = textures_.alloc(std::move(t));
                 textures_.get(h)->desc.name = textures_.get(h)->name.c_str();
@@ -227,6 +315,12 @@ namespace conduit {
                 g.layout = desc.layout;
                 g.entries.assign(desc.entries.begin(), desc.entries.end());
                 g.layout_entries = layout->entries;
+                for (const bind_group_entry& e : g.entries)
+                    if (const null_texture* t = textures_.get(e.texture.texture))
+                        if (e.texture.format != format::unknown && e.texture.format != t->desc.format &&
+                            e.texture.format != t->desc.view_format)
+                            report_device_error("CreateBindGroup: texture '" + t->name +
+                                                "' is viewed in a format it was not created with a view_format for");
                 for (const bind_layout_entry& le : layout->entries) {
                     uint32_t found = 0;
                     for (const bind_group_entry& e : g.entries)
@@ -236,6 +330,13 @@ namespace conduit {
                         report_device_error("CreateBindGroup: binding " + std::to_string(le.binding) +
                                             " is not fully populated");
                 }
+                for (const bind_layout_entry& le : g.layout_entries)
+                    if (le.type == binding_type::uniform_buffer_dynamic)
+                        g.dynamic_count++;
+                // a transient group is bound about once, so it works its resources out when bound instead
+                g.resolved = !desc.per_frame;
+                if (g.resolved)
+                    resolve_bound(g, g.bound);
                 stats_.live_bind_groups++;
                 return bind_groups_.alloc(std::move(g));
             }
@@ -283,9 +384,7 @@ namespace conduit {
                 null_texture* t = textures_.get(h);
                 if (!t)
                     return;
-                for (auto& layer : t->data)
-                    for (auto& mip : layer)
-                        stats_.texture_bytes -= mip.size();
+                stats_.texture_bytes -= t->data.size();
                 stats_.live_textures--;
                 validator_.on_destroy(h);
                 retire([this, h] { textures_.free(h); });
@@ -374,14 +473,21 @@ namespace conduit {
                 m.device_usage = stats_.buffer_bytes + stats_.texture_bytes;
                 return m;
             }
-            device_stats stats() const override { return stats_; }
+            device_stats stats() const override {
+                device_stats s = stats_;
+                counters_.fill(s);
+                return s;
+            }
             float timestamp_period_ns() const override { return 1.0f; }
 
             state_validator& validator() { return validator_; }
             void report_device_error(const std::string& message) { device_errors_.push_back(message); }
             std::vector<std::string> take_device_errors() { return std::move(device_errors_); }
 
-            void retire(std::function<void()> fn) { retire_.push(submitted_, std::move(fn)); }
+            void retire(std::function<void()> fn) {
+                validator_.touch();
+                retire_.push(submitted_, std::move(fn));
+            }
 
         private:
             handle_pool<buffer_tag, null_buffer> buffers_;
@@ -395,6 +501,7 @@ namespace conduit {
             handle_pool<query_set_tag, null_query> queries_;
             handle_pool<fence_tag, null_fence> fences_;
             device_stats stats_;
+            device_counters counters_;
             queue_serials submitted_{};
             std::vector<std::unique_ptr<null_command_list>> lists_;
             std::vector<null_command_list*> free_lists_[queue_count];
@@ -424,21 +531,21 @@ namespace conduit {
                 if (in_rendering_)
                     error("barrier recorded inside a rendering pass");
                 device_.validator().barrier(b);
-                device_.stats_.barriers++;
+                counters_.barriers++;
             }
             for (const buffer_barrier& b : buffers) {
                 if (in_rendering_)
                     error("barrier recorded inside a rendering pass");
                 device_.validator().barrier(b);
-                device_.stats_.barriers++;
+                counters_.barriers++;
             }
         }
 
         void null_command_list::uav_barrier(buffer_handle) {
-            device_.stats_.barriers++;
+            counters_.barriers++;
         }
         void null_command_list::uav_barrier(texture_handle) {
-            device_.stats_.barriers++;
+            counters_.barriers++;
         }
 
         void null_command_list::copy_buffer(buffer_handle dst, uint64_t dst_offset, buffer_handle src,
@@ -472,7 +579,11 @@ namespace conduit {
                 }
                 const format_info& fi = get_format_info(t->desc.format);
                 for (const buffer_texture_copy& r : copy) {
-                    auto& mip = t->data[r.layer][r.mip];
+                    if (!t->has(r.layer, r.mip)) {
+                        device_.report_device_error("CopyBufferToTexture out of range");
+                        return;
+                    }
+                    const std::span<uint8_t> mip = t->mip(r.layer, r.mip);
                     const uint32_t mip_w = mip_extent(t->desc.width, r.mip);
                     const uint32_t tex_row = row_bytes(t->desc.format, mip_w);
                     const uint32_t row_size = row_bytes(t->desc.format, r.width);
@@ -513,7 +624,11 @@ namespace conduit {
                 }
                 const format_info& fi = get_format_info(t->desc.format);
                 for (const buffer_texture_copy& r : copy) {
-                    auto& mip = t->data[r.layer][r.mip];
+                    if (!t->has(r.layer, r.mip)) {
+                        device_.report_device_error("CopyTextureToBuffer out of range");
+                        return;
+                    }
+                    const std::span<uint8_t> mip = t->mip(r.layer, r.mip);
                     const uint32_t mip_w = mip_extent(t->desc.width, r.mip);
                     const uint32_t tex_row = row_bytes(t->desc.format, mip_w);
                     const uint32_t row_size = row_bytes(t->desc.format, r.width);
@@ -556,8 +671,12 @@ namespace conduit {
                 }
                 const format_info& fi = get_format_info(s->desc.format);
                 for (const texture_copy& r : copy) {
-                    auto& sm = s->data[r.src_layer][r.src_mip];
-                    auto& dm = d->data[r.dst_layer][r.dst_mip];
+                    if (!s->has(r.src_layer, r.src_mip) || !d->has(r.dst_layer, r.dst_mip)) {
+                        device_.report_device_error("CopyTexture out of range");
+                        return;
+                    }
+                    const std::span<uint8_t> sm = s->mip(r.src_layer, r.src_mip);
+                    const std::span<uint8_t> dm = d->mip(r.dst_layer, r.dst_mip);
                     const uint32_t s_row = row_bytes(s->desc.format, mip_extent(s->desc.width, r.src_mip));
                     const uint32_t d_row = row_bytes(d->desc.format, mip_extent(d->desc.width, r.dst_mip));
                     const uint32_t row_size = row_bytes(s->desc.format, r.width);
@@ -598,6 +717,7 @@ namespace conduit {
             if (in_rendering_)
                 error("BeginRendering inside a rendering pass");
             in_rendering_ = true;
+            draw_checked_ = false;
             color_count_ = desc.color_count;
             for (uint32_t i = 0; i < desc.color_count; i++) {
                 const color_attachment& a = desc.colors[i];
@@ -609,6 +729,9 @@ namespace conduit {
                 color_formats_[i] = td->format;
                 if (!has(td->usage, texture_usage::color_target))
                     error("BeginRendering: texture '" + std::string(td->name) + "' lacks ColorTarget usage");
+                if (has(td->usage, texture_usage::transient) && (a.load == load_op::load || a.store == store_op::store))
+                    error("BeginRendering: transient texture '" + std::string(td->name) +
+                          "' cannot be loaded or stored");
                 device_.validator().expect_texture(a.texture, {a.mip, 1, a.layer, 1}, state::color_target,
                                                    "BeginRendering colour");
             }
@@ -621,6 +744,11 @@ namespace conduit {
                     depth_format_ = td->format;
                     if (!has(td->usage, texture_usage::depth_target))
                         error("BeginRendering: texture '" + std::string(td->name) + "' lacks DepthTarget usage");
+                    if (has(td->usage, texture_usage::transient) &&
+                        (desc.depth.load == load_op::load || desc.depth.store == store_op::store ||
+                         desc.depth.read_only))
+                        error("BeginRendering: transient texture '" + std::string(td->name) +
+                              "' cannot be loaded or stored");
                     device_.validator().expect_texture(desc.depth.texture, {desc.depth.mip, 1, desc.depth.layer, 1},
                                                        desc.depth.read_only ? state::depth_read : state::depth_write,
                                                        "BeginRendering depth");
@@ -632,6 +760,7 @@ namespace conduit {
             if (!in_rendering_)
                 error("EndRendering without BeginRendering");
             in_rendering_ = false;
+            draw_checked_ = false;
         }
 
         void null_command_list::set_pipeline(pipeline_handle handle) {
@@ -643,7 +772,8 @@ namespace conduit {
             if (p->compute == in_rendering_)
                 error(p->compute ? "compute pipeline set inside a rendering pass"
                                  : "graphics pipeline set outside a rendering pass");
-            device_.stats_.pipeline_binds++;
+            counters_.pipeline_binds++;
+            draw_checked_ = draw_checked_ && pipeline_ == handle;
             pipeline_ = handle;
         }
 
@@ -654,51 +784,22 @@ namespace conduit {
                 error("SetBindGroup: unknown group or set index");
                 return;
             }
-            uint32_t dynamic_count = 0;
-            std::vector<state_validator::bound_resource> bound;
-            for (const bind_layout_entry& le : g->layout_entries) {
-                if (le.type == binding_type::uniform_buffer_dynamic)
-                    dynamic_count++;
-                for (const bind_group_entry& e : g->entries) {
-                    if (e.binding != le.binding)
-                        continue;
-                    state_validator::bound_resource r;
-                    r.range = e.texture.range;
-                    switch (le.type) {
-                    case binding_type::sampled_texture:
-                        r.texture = e.texture.texture;
-                        r.want = state::shader_read | state::depth_read_sampled;
-                        break;
-                    case binding_type::storage_texture_rw:
-                        r.texture = e.texture.texture;
-                        r.want = state::shader_write;
-                        break;
-                    case binding_type::storage_buffer_rw:
-                        r.buffer = e.buffer.buffer;
-                        r.want = state::shader_write;
-                        break;
-                    case binding_type::storage_buffer:
-                        r.buffer = e.buffer.buffer;
-                        r.want = state::shader_read;
-                        break;
-                    case binding_type::uniform_buffer:
-                    case binding_type::uniform_buffer_dynamic:
-                        r.buffer = e.buffer.buffer;
-                        r.want = state::uniform_buffer;
-                        break;
-                    case binding_type::sampler:
-                        break;
-                    }
-                    if (r.texture || r.buffer)
-                        bound.push_back(r);
-                }
-            }
-            if (dynamic_count != offsets.size())
-                error("SetBindGroup: expected " + std::to_string(dynamic_count) + " dynamic offsets, got " +
+            if (g->dynamic_count != offsets.size())
+                error("SetBindGroup: expected " + std::to_string(g->dynamic_count) + " dynamic offsets, got " +
                       std::to_string(offsets.size()));
-            device_.validator().expect_all(bound, "SetBindGroup");
+            if (g->resolved) {
+                const uint64_t version = device_.validator().version();
+                if (g->passed.load(std::memory_order_relaxed) != version &&
+                    device_.validator().expect_all(g->bound, "SetBindGroup"))
+                    g->passed.store(version, std::memory_order_relaxed);
+            } else {
+                thread_local std::vector<state_validator::bound_resource> scratch;
+                resolve_bound(*g, scratch);
+                device_.validator().expect_all(scratch, "SetBindGroup");
+            }
+            draw_checked_ = draw_checked_ && bound_sets_[set];
             bound_sets_[set] = group;
-            device_.stats_.bind_group_binds++;
+            counters_.group_binds++;
         }
 
         void null_command_list::push_constants(const void*, uint32_t bytes, uint32_t offset) {
@@ -712,16 +813,35 @@ namespace conduit {
                 error("SetVertexBuffer: slot out of range");
                 return;
             }
-            device_.validator().expect_buffer(buffer, state::vertex_buffer, "SetVertexBuffer");
-            vertex_buffers_[slot] = buffer;
+            const uint64_t version = device_.validator().version();
+            if (vertex_buffers_[slot] != buffer || vertex_passed_[slot] != version) {
+                vertex_passed_[slot] =
+                    device_.validator().expect_buffer_ok(buffer, state::vertex_buffer, "SetVertexBuffer") ? version : 0;
+                draw_checked_ = draw_checked_ && vertex_buffers_[slot] && buffer;
+                vertex_buffers_[slot] = buffer;
+            }
         }
 
         void null_command_list::set_index_buffer(buffer_handle buffer, index_type, uint64_t) {
-            device_.validator().expect_buffer(buffer, state::index_buffer, "SetIndexBuffer");
-            index_buffer_ = buffer;
+            const uint64_t version = device_.validator().version();
+            if (index_buffer_ != buffer || index_passed_ != version) {
+                index_passed_ =
+                    device_.validator().expect_buffer_ok(buffer, state::index_buffer, "SetIndexBuffer") ? version : 0;
+                index_buffer_ = buffer;
+            }
         }
 
         void null_command_list::check_draw(const char* what) {
+            const uint64_t version = device_.validator().version();
+            if (draw_checked_ && draw_version_ == version) {
+                counters_.draws++;
+                return;
+            }
+            bool ok = in_rendering_;
+            const auto error = [&](const std::string& message) {
+                ok = false;
+                this->error(message);
+            };
             if (!in_rendering_)
                 error(std::string(what) + " outside a rendering pass");
             null_pipeline* p = device_.pipelines_.get(pipeline_);
@@ -747,7 +867,9 @@ namespace conduit {
                 for (uint32_t s = 0; s < max_bind_groups; s++)
                     if (layout->desc.sets[s] && !bound_sets_[s])
                         error(std::string(what) + ": bind group " + std::to_string(s) + " not set");
-            device_.stats_.draws++;
+            draw_checked_ = ok;
+            draw_version_ = version;
+            counters_.draws++;
         }
 
         void null_command_list::draw_indexed(uint32_t, uint32_t, uint32_t, int32_t, uint32_t) {
@@ -761,7 +883,7 @@ namespace conduit {
             device_.validator().expect_buffer(args, state::indirect_argument, "DrawIndexedIndirect args");
             if (!index_buffer_)
                 error("DrawIndexedIndirect without an index buffer");
-            device_.stats_.indirect_draws++;
+            counters_.indirect++;
         }
 
         void null_command_list::draw_indexed_indirect_count(buffer_handle args, uint64_t, buffer_handle count_buffer,
@@ -771,7 +893,7 @@ namespace conduit {
             device_.validator().expect_buffer(count_buffer, state::indirect_argument, "DrawIndexedIndirectCount count");
             if (!index_buffer_)
                 error("DrawIndexedIndirectCount without an index buffer");
-            device_.stats_.indirect_draws++;
+            counters_.indirect++;
         }
 
         void null_command_list::dispatch(uint32_t, uint32_t, uint32_t) {
@@ -780,7 +902,7 @@ namespace conduit {
                 error("Dispatch inside a rendering pass");
             if (!p || !p->compute)
                 error("Dispatch without a compute pipeline");
-            device_.stats_.dispatches++;
+            counters_.dispatches++;
         }
 
         void null_command_list::dispatch_indirect(buffer_handle args, uint64_t) {
@@ -815,10 +937,11 @@ namespace conduit {
                 if (null->open_labels() != 0)
                     report_device_error("command list submitted with an open debug label");
                 null->run_ops();
+                counters_.add(null->counters());
                 free_lists_[static_cast<size_t>(queue)].push_back(null);
             }
             submitted_[static_cast<size_t>(queue)]++;
-            stats_.submits++;
+            counters_.count_submit();
             for (const fence_op& s : desc.signals)
                 signal_fence(s.fence, s.value);
         }

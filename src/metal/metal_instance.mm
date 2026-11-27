@@ -58,6 +58,7 @@ namespace conduit::metal {
             bool acquire(image& out) override {
                 if (!width_ || !height_ || !handle_)
                     return false;
+                const autorelease_scope pool;
                 drawable_ = [layer_ nextDrawable];
                 if (!drawable_)
                     return false;
@@ -70,9 +71,10 @@ namespace conduit::metal {
             void present() override {
                 if (!drawable_)
                     return;
+                const autorelease_scope pool;
                 id<MTLCommandBuffer> cb = [device_.queue() commandBuffer];
                 [cb presentDrawable:drawable_];
-                [cb commit];
+                device_.commit(cb);
                 drawable_ = nil;
             }
 

@@ -2,6 +2,7 @@
 #include "d3d11/d3d11_internal.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -19,6 +20,14 @@ namespace conduit::d3d11 {
 
         int class_index(char c) {
             return c == 'b' ? 0 : c == 't' ? 1 : c == 's' ? 2 : 3;
+        }
+
+        // hlsl semantics ignore case; needle is lowercase
+        bool contains_nocase(std::string_view text, std::string_view needle) {
+            const auto it = std::search(text.begin(), text.end(), needle.begin(), needle.end(), [](char a, char b) {
+                return static_cast<char>(std::tolower(static_cast<unsigned char>(a))) == b;
+            });
+            return it != text.end();
         }
     }
 
@@ -125,7 +134,10 @@ namespace conduit::d3d11 {
         l.storage_buffer_alignment = 16;
         l.copy_row_pitch_alignment = 4;
         l.copy_offset_alignment = 4;
-        l.max_buffer_size = 1ull << 30;
+        // the runtime caps any resource at max(128 MB, a quarter of dedicated memory), never above 2 GB
+        l.max_buffer_size = std::clamp<uint64_t>(
+            caps_.adapter.dedicated_vram / 4, uint64_t{D3D11_REQ_RESOURCE_SIZE_IN_MEGABYTES_EXPRESSION_A_TERM} << 20,
+            uint64_t{D3D11_REQ_RESOURCE_SIZE_IN_MEGABYTES_EXPRESSION_C_TERM} << 20);
         l.max_anisotropy = 16.0f;
         l.max_msaa_samples = 1;
         for (const UINT samples : {8u, 4u, 2u}) {
@@ -149,6 +161,9 @@ namespace conduit::d3d11 {
         f.async_compute = false;
         f.dedicated_copy_queue = false;
         f.timestamp_queries = false;
+        D3D11_FEATURE_DATA_DOUBLES doubles{};
+        f.shader_float64 = SUCCEEDED(device_->CheckFeatureSupport(D3D11_FEATURE_DOUBLES, &doubles, sizeof(doubles))) &&
+                           doubles.DoublePrecisionFloatShaderOps;
 
         for (uint32_t i = 1; i < static_cast<uint32_t>(format::count); i++) {
             const format fmt = static_cast<format>(i);
@@ -230,8 +245,8 @@ namespace conduit::d3d11 {
         }
         if (desc.memory != memory_class::gpu_only)
             b.shadow.assign(size, 0);
-        stats_.buffer_bytes += size * (b.constant ? 2 : 1);
-        stats_.live_buffers++;
+        buffer_bytes_ += static_cast<int64_t>(size * (b.constant ? 2 : 1));
+        live_buffers_++;
         const buffer_handle h = buffers_.alloc(std::move(b));
         buffers_.get(h)->desc.name = buffers_.get(h)->name.c_str();
         return h;
@@ -293,8 +308,9 @@ namespace conduit::d3d11 {
         for (uint32_t m = 0; m < t.desc.mips; m++)
             bytes += static_cast<uint64_t>(row_bytes(desc.format, mip_extent(desc.width, m))) *
                      row_blocks(desc.format, mip_extent(desc.height, m)) * layer_count_of(t.desc) * depth_of(t.desc);
-        stats_.texture_bytes += bytes * t.desc.samples;
-        stats_.live_textures++;
+        t.bytes = bytes * t.desc.samples;
+        texture_bytes_ += static_cast<int64_t>(t.bytes);
+        live_textures_++;
         const texture_handle h = textures_.alloc(std::move(t));
         textures_.get(h)->desc.name = textures_.get(h)->name.c_str();
         return h;
@@ -342,14 +358,33 @@ namespace conduit::d3d11 {
     }
 
     bind_group_handle device::create_bind_group(const bind_group_desc& desc) {
-        if (!bind_layouts_.get(desc.layout)) {
+        const bind_layout* layout = bind_layouts_.get(desc.layout);
+        if (!layout) {
             report_error("CreateBindGroup: unknown layout");
             return {};
         }
         bind_group g;
         g.layout = desc.layout;
         g.entries.assign(desc.entries.begin(), desc.entries.end());
-        stats_.live_bind_groups++;
+        // a per-frame group is bound about once, so it resolves its views at that bind instead
+        if (!desc.per_frame)
+            g.views.resize(g.entries.size());
+        for (size_t i = 0; i < g.views.size(); i++) {
+            const bind_group_entry& e = g.entries[i];
+            if (e.array_index != 0)
+                continue;
+            const auto it =
+                std::lower_bound(layout->entries.begin(), layout->entries.end(), e.binding,
+                                 [](const bind_layout_entry& l, uint32_t binding) { return l.binding < binding; });
+            if (it == layout->entries.end() || it->binding != e.binding || it->type != binding_type::sampled_texture)
+                continue;
+            if (texture* t = textures_.get(e.texture.texture)) {
+                g.views[i].srv.copy_from(
+                    srv_of(*t, e.texture.range, it->view_dim, e.texture.format, e.texture.stencil));
+                g.views[i].dim = it->view_dim;
+            }
+        }
+        live_groups_++;
         return bind_groups_.alloc(std::move(g));
     }
 
@@ -372,16 +407,18 @@ namespace conduit::d3d11 {
         buffer b;
         if (!buffers_.free(h, &b))
             return;
-        stats_.buffer_bytes -= b.gpu_size * (b.constant ? 2 : 1);
-        stats_.live_buffers--;
+        buffer_bytes_ -= static_cast<int64_t>(b.gpu_size * (b.constant ? 2 : 1));
+        live_buffers_--;
     }
 
     void device::destroy(texture_handle h) {
         texture t;
         if (!textures_.free(h, &t))
             return;
-        if (!t.external)
-            stats_.live_textures--;
+        if (t.external)
+            return;
+        texture_bytes_ -= static_cast<int64_t>(t.bytes);
+        live_textures_--;
     }
 
     void device::destroy(sampler_handle h) {
@@ -395,14 +432,14 @@ namespace conduit::d3d11 {
     }
     void device::destroy(bind_group_handle h) {
         if (bind_groups_.free(h))
-            stats_.live_bind_groups--;
+            live_groups_--;
     }
     void device::destroy(pipeline_layout_handle h) {
         pipeline_layouts_.free(h);
     }
     void device::destroy(pipeline_handle h) {
         if (pipelines_.free(h))
-            stats_.live_pipelines--;
+            live_pipelines_--;
     }
     void device::destroy(query_set_handle h) {
         queries_.free(h);
@@ -429,6 +466,12 @@ namespace conduit::d3d11 {
     void device::flush(buffer_handle handle, uint64_t offset, uint64_t size) {
         buffer* b = buffers_.get(handle);
         if (!b || b->shadow.empty() || b->desc.memory == memory_class::readback)
+            return;
+        // uniform reads of a cpu-visible buffer copy from its shadow at record time, so main only needs these bytes
+        // when the gpu reads it some other way or the constant twin is copied from it
+        constexpr buffer_usage gpu_reads = buffer_usage::vertex | buffer_usage::index | buffer_usage::storage |
+                                           buffer_usage::indirect | buffer_usage::copy_src;
+        if (!b->constant && !has(b->desc.usage, gpu_reads))
             return;
         const uint64_t lo = offset & ~3ull;
         const uint64_t hi = std::min<uint64_t>(b->gpu_size, align_up(offset + size, 4));
@@ -469,6 +512,31 @@ namespace conduit::d3d11 {
             }
             immediate_->Unmap(p.staging.get(), 0);
         }
+        std::lock_guard views(view_mutex_);
+        for (pending_readback& p : pending)
+            if (p.staging && staging_.size() < 16)
+                staging_.push_back(std::move(p.staging));
+    }
+
+    winrt::com_ptr<ID3D11Texture2D> device::take_staging(const D3D11_TEXTURE2D_DESC& desc) {
+        {
+            std::lock_guard lock(view_mutex_);
+            for (size_t i = 0; i < staging_.size(); i++) {
+                D3D11_TEXTURE2D_DESC d{};
+                staging_[i]->GetDesc(&d);
+                if (d.Width == desc.Width && d.Height == desc.Height && d.Format == desc.Format) {
+                    winrt::com_ptr<ID3D11Texture2D> t = std::move(staging_[i]);
+                    if (i + 1 != staging_.size())
+                        staging_[i] = std::move(staging_.back());
+                    staging_.pop_back();
+                    return t;
+                }
+            }
+        }
+        winrt::com_ptr<ID3D11Texture2D> t;
+        if (FAILED(device_->CreateTexture2D(&desc, nullptr, t.put())))
+            return nullptr;
+        return t;
     }
 
     ID3D11ShaderResourceView* device::srv_of(texture& t, const subresource_range& range, texture_dim dim,
@@ -821,8 +889,12 @@ namespace conduit::d3d11 {
             return {};
         }
         p.stream_count = desc.stream_count;
-        for (uint32_t i = 0; i < desc.stream_count; i++)
+        for (uint32_t i = 0; i < desc.stream_count; i++) {
             p.strides[i] = desc.streams[i].stride;
+            if (desc.streams[i].step == vertex_step::vertex)
+                p.per_vertex |= 1u << i;
+        }
+        p.vertex_id = contains_nocase(vs->source, "sv_vertexid");
         p.topology = to_d3d(desc.topology);
 
         D3D11_RASTERIZER_DESC rd{};
@@ -873,7 +945,7 @@ namespace conduit::d3d11 {
         if (FAILED(device_->CreateBlendState(&bd, p.blend.put())))
             return {};
 
-        stats_.live_pipelines++;
+        live_pipelines_++;
         return pipelines_.alloc(std::move(p));
     }
 
@@ -894,7 +966,7 @@ namespace conduit::d3d11 {
         }
         if (FAILED(device_->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, p.cs.put())))
             return {};
-        stats_.live_pipelines++;
+        live_pipelines_++;
         return pipelines_.alloc(std::move(p));
     }
 
@@ -1018,7 +1090,7 @@ namespace conduit::d3d11 {
                 return m;
             }
         }
-        m.device_usage = stats_.buffer_bytes + stats_.texture_bytes;
+        m.device_usage = static_cast<uint64_t>((std::max<int64_t>)(0, buffer_bytes_ + texture_bytes_));
         return m;
     }
 
@@ -1037,37 +1109,44 @@ namespace conduit::d3d11 {
             lists_.push_back(std::move(made));
             list = lists_.back().get();
         }
-        list->begin();
+        list->begin(queue);
         return list;
     }
 
     void device::submit(queue_type, const submit_desc& desc) {
-        std::vector<winrt::com_ptr<ID3D11CommandList>> commands;
         for (conduit::command_list* base : desc.lists) {
             auto* list = static_cast<cmd_list*>(base);
-            if (ID3D11CommandList* cl = list->finish()) {
-                winrt::com_ptr<ID3D11CommandList> owned;
-                owned.copy_from(cl);
-                commands.push_back(std::move(owned));
-            }
+            counters_.add(list->counters());
+            list->finish();
         }
         {
             auto lock = lock_context();
-            for (auto& cl : commands)
-                immediate_->ExecuteCommandList(cl.get(), adopted_ ? TRUE : FALSE);
+            for (conduit::command_list* base : desc.lists)
+                if (ID3D11CommandList* cl = static_cast<cmd_list*>(base)->finished())
+                    immediate_->ExecuteCommandList(cl, adopted_ ? TRUE : FALSE);
             for (const fence_op& op : desc.signals)
                 mark_submitted(op.fence, op.value);
         }
-        commands.clear();
+        for (conduit::command_list* base : desc.lists)
+            static_cast<cmd_list*>(base)->release_finished();
         {
             std::lock_guard lock(list_mutex_);
-            for (conduit::command_list* base : desc.lists) {
-                auto* list = static_cast<cmd_list*>(base);
-                list->release_finished();
-                free_lists_.push_back(list);
-            }
+            for (conduit::command_list* base : desc.lists)
+                free_lists_.push_back(static_cast<cmd_list*>(base));
         }
-        stats_.submits++;
+        counters_.count_submit();
+    }
+
+    device_stats device::stats() const {
+        device_stats s;
+        counters_.fill(s);
+        s.buffer_bytes = static_cast<uint64_t>((std::max<int64_t>)(0, buffer_bytes_));
+        s.texture_bytes = static_cast<uint64_t>((std::max<int64_t>)(0, texture_bytes_));
+        s.live_buffers = static_cast<uint32_t>(live_buffers_.load());
+        s.live_textures = static_cast<uint32_t>(live_textures_.load());
+        s.live_pipelines = static_cast<uint32_t>(live_pipelines_.load());
+        s.live_bind_groups = static_cast<uint32_t>(live_groups_.load());
+        return s;
     }
 
     std::unique_ptr<conduit::swapchain> device::create_swapchain(const swapchain_desc& desc) {

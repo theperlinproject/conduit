@@ -5,10 +5,17 @@
 #include <memory>
 #include <string>
 
+namespace conduit {
+    struct render_profile;
+}
+
 namespace conduit::vendor {
     enum class quality : uint8_t { native, ultra_quality, quality, balanced, performance, ultra_performance };
     float scale_of(quality quality);
     const char* quality_name(quality quality);
+    // the mode that renders at least this share of the output on each axis, so a profile's render scale maps
+    // to an upscaler mode without dropping below what the profile judged the gpu can shade
+    quality quality_for(float render_scale);
     void render_size_for(quality quality, uint32_t output_width, uint32_t output_height, uint32_t& width,
                          uint32_t& height);
 
@@ -126,6 +133,10 @@ namespace conduit::vendor {
         bool verbose_log = false;
         uint32_t application_id = 0;
     };
+
+    // what a session is worth starting for on the machine a profile describes. everything comes back off for
+    // a gpu these sdks do not serve, and session::begin then loads nothing at all
+    session_request request_for(const render_profile& profile);
 
     struct capabilities {
         bool dlss = false;

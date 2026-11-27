@@ -25,8 +25,8 @@ endif()
 
 if(CONDUIT_GLES)
     conduit_dependency(spirv_cross SPIRV-Cross https://github.com/KhronosGroup/SPIRV-Cross.git vulkan-sdk-1.4.328.1)
-    conduit_dependency(opengl_registry OpenGL-Registry https://github.com/KhronosGroup/OpenGL-Registry.git main)
-    conduit_dependency(egl_registry EGL-Registry https://github.com/KhronosGroup/EGL-Registry.git main)
+    conduit_dependency(opengl_registry OpenGL-Registry https://github.com/KhronosGroup/OpenGL-Registry.git 6af574a14089ccfee87efe230ebcdd8742859813)
+    conduit_dependency(egl_registry EGL-Registry https://github.com/KhronosGroup/EGL-Registry.git aa39a34729e6d20b0b982e279c351976a5c91075)
 endif()
 
 if(CONDUIT_D3D12)

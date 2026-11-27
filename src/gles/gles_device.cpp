@@ -176,6 +176,11 @@ namespace conduit::gles {
         features_.glsl_version = std::clamp(level * 10, 300u, 320u);
         features_.compute = level >= 31 && gl_.glDispatchCompute && gl_.glMemoryBarrier;
         features_.indirect = level >= 31 && gl_.glDrawElementsIndirect;
+        features_.multi_draw_indirect =
+            features_.indirect && ext("GL_EXT_multi_draw_indirect") && gl_.glMultiDrawElementsIndirect;
+        features_.base_vertex =
+            (level >= 32 || ext("GL_OES_draw_elements_base_vertex") || ext("GL_EXT_draw_elements_base_vertex")) &&
+            gl_.glDrawElementsBaseVertex && gl_.glDrawElementsInstancedBaseVertex;
         features_.storage_images = level >= 31 && gl_.glBindImageTexture && gl_.glMemoryBarrier;
         features_.indexed_blend =
             (level >= 32 || ext("GL_EXT_draw_buffers_indexed") || ext("GL_OES_draw_buffers_indexed")) &&
@@ -189,7 +194,8 @@ namespace conduit::gles {
         features_.float_blend = ext("GL_EXT_float_blend");
         features_.float_linear = ext("GL_OES_texture_float_linear");
         features_.anisotropy = ext("GL_EXT_texture_filter_anisotropic");
-        features_.s3tc = ext("GL_EXT_texture_compression_s3tc");
+        // a browser names it after its WebGL extension
+        features_.s3tc = ext("GL_EXT_texture_compression_s3tc") || ext("WEBGL_compressed_texture_s3tc");
         features_.bptc = ext("GL_EXT_texture_compression_bptc");
         features_.norm16 = ext("GL_EXT_texture_norm16");
         features_.border_clamp =
@@ -245,7 +251,8 @@ namespace conduit::gles {
         }
 
         device_features& f = caps_.features;
-        f.multi_draw_indirect = features_.indirect;
+        // only where one call really issues the batch; plain indirect draws are replayed one by one
+        f.multi_draw_indirect = features_.multi_draw_indirect;
         f.sampler_anisotropy = features_.anisotropy;
         f.texture_compression_bc = features_.s3tc && features_.bptc;
         f.unified_memory = true;
@@ -282,7 +289,8 @@ namespace conduit::gles {
                 if (g.needs_norm16)
                     renderable = false;
                 if (renderable) {
-                    use = use | format_use::color_target | format_use::msaa;
+                    // ES 3.0 has no multisampled integer renderbuffers
+                    use = use | format_use::color_target | (g.integer ? format_use::none : format_use::msaa);
                     if (blendable)
                         use = use | format_use::blendable;
                 }
@@ -354,6 +362,13 @@ namespace conduit::gles {
             cache_.unit_target[unit] = target;
         }
         gl_.glBindTexture(target, texture);
+    }
+
+    void device::sample_texture(uint32_t unit, GLenum target, GLuint texture) {
+        if (unit < cache_.unit_texture.size() && cache_.unit_texture[unit] == texture &&
+            cache_.unit_target[unit] == target)
+            return;
+        use_texture(unit, target, texture);
     }
 
     void device::use_program(GLuint program) {
@@ -649,7 +664,10 @@ namespace conduit::gles {
     }
 
     void device::destroy(shader_handle h) {
-        thread_.post([this, h] { shaders_.free(h); });
+        thread_.post([this, h] {
+            forget_programs(h);
+            shaders_.free(h);
+        });
     }
     void device::destroy(bind_layout_handle h) {
         thread_.post([this, h] { bind_layouts_.free(h); });
@@ -658,18 +676,42 @@ namespace conduit::gles {
         thread_.post([this, h] { bind_groups_.free(h); });
     }
     void device::destroy(pipeline_layout_handle h) {
-        thread_.post([this, h] { pipeline_layouts_.free(h); });
+        thread_.post([this, h] {
+            forget_programs(h);
+            pipeline_layouts_.free(h);
+        });
     }
     void device::destroy(pipeline_handle h) {
         thread_.post([this, h] {
             pipeline p;
-            if (!pipelines_.free(h, &p))
-                return;
-            if (cache_.program == p.program)
-                cache_.program = ~0u;
-            if (p.program)
-                gl_.glDeleteProgram(p.program);
+            if (pipelines_.free(h, &p))
+                release_program(p.program);
         });
+    }
+
+    void device::release_program(GLuint program) {
+        std::lock_guard lock(program_mutex_);
+        const auto users = program_users_.find(program);
+        if (users == program_users_.end() || --users->second > 0)
+            return;
+        program_users_.erase(users);
+        std::erase_if(programs_, [&](const auto& entry) { return entry.second.program == program; });
+        if (cache_.program == program)
+            cache_.program = ~0u;
+        gl_.glDeleteProgram(program);
+    }
+
+    void device::forget_programs(shader_handle shader) {
+        std::lock_guard lock(program_mutex_);
+        std::erase_if(programs_, [&](const auto& entry) {
+            const program_key& k = entry.first;
+            return k.vertex == shader || k.fragment == shader || k.compute == shader;
+        });
+    }
+
+    void device::forget_programs(pipeline_layout_handle layout) {
+        std::lock_guard lock(program_mutex_);
+        std::erase_if(programs_, [&](const auto& entry) { return entry.first.layout == layout; });
     }
     void device::destroy(query_set_handle h) {
         thread_.post([this, h] { queries_.free(h); });
@@ -695,10 +737,11 @@ namespace conduit::gles {
             gl_.glDeleteSamplers(1, &s.gl);
             gl_.glDeleteSamplers(1, &s.gl_nearest);
         });
-        pipelines_.for_each([&](pipeline_handle, pipeline& p) {
-            if (p.program)
-                gl_.glDeleteProgram(p.program);
-        });
+        // pipelines share programs: each is deleted once
+        for (const auto& [program, users] : program_users_)
+            gl_.glDeleteProgram(program);
+        program_users_.clear();
+        programs_.clear();
         for (auto& [key, fb] : framebuffers_)
             gl_.glDeleteFramebuffers(1, &fb.id);
         framebuffers_.clear();
@@ -737,9 +780,10 @@ namespace conduit::gles {
         auto copy = std::make_shared<std::vector<uint8_t>>(b->shadow.begin() + static_cast<ptrdiff_t>(lo),
                                                            b->shadow.begin() + static_cast<ptrdiff_t>(hi));
         thread_.post([this, handle, lo, copy] {
-            const buffer* target = buffers_.get(handle);
+            buffer* target = buffers_.get(handle);
             if (!target)
                 return;
+            target->flushed = true;
             gl_.glBindBuffer(GL_COPY_WRITE_BUFFER, target->gl);
             gl_.glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(lo), static_cast<GLsizeiptr>(copy->size()),
                                 copy->data());
@@ -830,9 +874,11 @@ namespace conduit::gles {
         counters_.count_submit();
         std::vector<fence_op> waits(desc.waits.begin(), desc.waits.end());
         std::vector<fence_op> signals(desc.signals.begin(), desc.signals.end());
-        thread_.post([this, streams = std::move(streams), waits = std::move(waits), signals = std::move(signals)] {
-            execute(streams, waits, signals);
-        });
+        thread_.post(
+            [this, streams = std::move(streams), waits = std::move(waits), signals = std::move(signals)]() mutable {
+                execute(streams, waits, signals);
+                recycle_streams(streams);
+            });
     }
 
     void device::execute(const std::vector<std::vector<uint8_t>>& streams, const std::vector<fence_op>& waits,

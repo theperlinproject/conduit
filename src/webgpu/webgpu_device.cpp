@@ -54,6 +54,36 @@ namespace conduit::webgpu {
             return bits;
         }
 
+        uint64_t texture_bytes(const texture_desc& d) {
+            uint64_t bytes = 0;
+            for (uint32_t m = 0; m < d.mips; m++)
+                bytes += static_cast<uint64_t>(row_bytes(d.format, mip_extent(d.width, m))) *
+                         row_blocks(d.format, mip_extent(d.height, m)) * layer_count_of(d) * depth_of(d);
+            return bytes * d.samples;
+        }
+
+        uint64_t group_key(WGPUBindGroupLayout layout, std::span<const WGPUBindGroupEntry> entries) {
+            uint64_t h = 1469598103934665603ull;
+            const auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+            mix(reinterpret_cast<uintptr_t>(layout));
+            for (const WGPUBindGroupEntry& e : entries) {
+                mix(e.binding);
+                mix(reinterpret_cast<uintptr_t>(e.buffer));
+                mix(e.offset);
+                mix(e.size);
+                mix(reinterpret_cast<uintptr_t>(e.sampler));
+                mix(reinterpret_cast<uintptr_t>(e.textureView));
+            }
+            return h;
+        }
+
+        bool same_entries(std::span<const WGPUBindGroupEntry> a, std::span<const WGPUBindGroupEntry> b) {
+            return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](const auto& x, const auto& y) {
+                return x.binding == y.binding && x.buffer == y.buffer && x.offset == y.offset && x.size == y.size &&
+                       x.sampler == y.sampler && x.textureView == y.textureView;
+            });
+        }
+
         bool kind_matches(binding_type type, resource_kind kind) {
             switch (type) {
             case binding_type::uniform_buffer:
@@ -127,6 +157,7 @@ namespace conduit::webgpu {
         empty_group_ = owned<WGPUBindGroup>(wgpuDeviceCreateBindGroup(device_.get(), &gd));
 
         frame_fence_ = create_fence(0);
+        frame_submissions_.assign((std::max)(1u, options_.frames_in_flight) + 1, 0);
         return nearest_sampler_ && empty_layout_ && empty_group_;
     }
 
@@ -159,8 +190,14 @@ namespace conduit::webgpu {
         f.unified_memory = caps_.adapter.type == adapter_type::integrated || caps_.adapter.type == adapter_type::cpu;
         f.async_compute = false;
         f.dedicated_copy_queue = false;
+#if defined(__EMSCRIPTEN__)
         f.multi_draw_indirect = false;
         f.draw_indirect_count = false;
+#else
+        // wgpu-native extensions: one call for a whole batch, and a real gpu-side count where the backend has one
+        f.multi_draw_indirect = has(static_cast<WGPUFeatureName>(WGPUNativeFeature_MultiDrawIndirect));
+        f.draw_indirect_count = has(static_cast<WGPUFeatureName>(WGPUNativeFeature_MultiDrawIndirectCount));
+#endif
 
         const bool f32_filter = has(WGPUFeatureName_Float32Filterable);
         const bool f32_blend = has(WGPUFeatureName_Float32Blendable);
@@ -232,8 +269,8 @@ namespace conduit::webgpu {
             return {};
         if (desc.memory != memory_class::gpu_only)
             b.shadow.assign(b.gpu_size, 0);
-        stats_.buffer_bytes += b.gpu_size;
-        stats_.live_buffers++;
+        buffer_bytes_ += static_cast<int64_t>(b.gpu_size);
+        live_buffers_++;
         const buffer_handle h = buffers_.alloc(std::move(b));
         buffers_.get(h)->desc.name = buffers_.get(h)->name.c_str();
         return h;
@@ -274,12 +311,8 @@ namespace conduit::webgpu {
         t.native = owned<WGPUTexture>(wgpuDeviceCreateTexture(device_.get(), &td));
         if (!t.native)
             return {};
-        uint64_t bytes = 0;
-        for (uint32_t m = 0; m < t.desc.mips; m++)
-            bytes += static_cast<uint64_t>(row_bytes(desc.format, mip_extent(desc.width, m))) *
-                     row_blocks(desc.format, mip_extent(desc.height, m)) * layer_count_of(t.desc) * depth_of(t.desc);
-        stats_.texture_bytes += bytes * t.desc.samples;
-        stats_.live_textures++;
+        texture_bytes_ += static_cast<int64_t>(texture_bytes(t.desc));
+        live_textures_++;
         const texture_handle h = textures_.alloc(std::move(t));
         textures_.get(h)->desc.name = textures_.get(h)->name.c_str();
         return h;
@@ -290,7 +323,6 @@ namespace conduit::webgpu {
         s.desc = desc;
         s.linear = desc.min == filter::linear || desc.mag == filter::linear || desc.mip == filter::linear;
         WGPUSamplerDescriptor sd{};
-        sd.label = view("sampler");
         sd.addressModeU = to_address(desc.u);
         sd.addressModeV = to_address(desc.v);
         sd.addressModeW = to_address(desc.w);
@@ -350,7 +382,8 @@ namespace conduit::webgpu {
         bind_group g;
         g.layout = desc.layout;
         g.entries.assign(desc.entries.begin(), desc.entries.end());
-        stats_.live_bind_groups++;
+        g.per_frame = desc.per_frame;
+        live_groups_++;
         return bind_groups_.alloc(std::move(g));
     }
 
@@ -373,15 +406,16 @@ namespace conduit::webgpu {
         buffer b;
         if (!buffers_.free(h, &b))
             return;
-        stats_.buffer_bytes -= b.gpu_size;
-        stats_.live_buffers--;
+        buffer_bytes_ -= static_cast<int64_t>(b.gpu_size);
+        live_buffers_--;
     }
 
     void webgpu_device::destroy(texture_handle h) {
         texture t;
-        if (!textures_.free(h, &t))
+        if (!textures_.free(h, &t) || t.external)
             return;
-        stats_.live_textures--;
+        texture_bytes_ -= static_cast<int64_t>(texture_bytes(t.desc));
+        live_textures_--;
     }
 
     void webgpu_device::destroy(sampler_handle h) {
@@ -395,14 +429,14 @@ namespace conduit::webgpu {
     }
     void webgpu_device::destroy(bind_group_handle h) {
         if (bind_groups_.free(h))
-            stats_.live_bind_groups--;
+            live_groups_--;
     }
     void webgpu_device::destroy(pipeline_layout_handle h) {
         pipeline_layouts_.free(h);
     }
     void webgpu_device::destroy(pipeline_handle h) {
         if (pipelines_.free(h))
-            stats_.live_pipelines--;
+            live_pipelines_--;
     }
     void webgpu_device::destroy(query_set_handle h) {
         queries_.free(h);
@@ -430,29 +464,36 @@ namespace conduit::webgpu {
         buffer* b = buffers_.get(handle);
         if (!b || b->shadow.empty() || b->desc.memory == memory_class::readback)
             return;
+        // a zero size means to the end, as on the other backends
         const uint64_t lo = offset & ~3ull;
-        const uint64_t hi = std::min<uint64_t>(b->gpu_size, align_up(offset + size, 4));
+        const uint64_t hi = size ? std::min<uint64_t>(b->gpu_size, align_up(offset + size, 4)) : b->gpu_size;
         if (hi <= lo)
             return;
         wgpuQueueWriteBuffer(queue_.get(), b->native.get(), lo, b->shadow.data() + lo, static_cast<size_t>(hi - lo));
     }
 
-    void webgpu_device::invalidate(buffer_handle handle, uint64_t, uint64_t) {
+    void webgpu_device::invalidate(buffer_handle handle, uint64_t offset, uint64_t size) {
         buffer* b = buffers_.get(handle);
         if (!b || b->desc.memory != memory_class::readback || !map_sync_)
             return;
+        // map and copy only the asked-for range: mapAsync wants an offset multiple of 8 and a size multiple of 4
+        const uint64_t lo = std::min<uint64_t>(offset & ~7ull, b->gpu_size);
+        const uint64_t hi = size ? std::min<uint64_t>(b->gpu_size, align_up(offset + size, 4)) : b->gpu_size;
+        if (hi <= lo)
+            return;
+        const size_t bytes = static_cast<size_t>(hi - lo);
         map_state state;
         WGPUBufferMapCallbackInfo info{};
         info.mode = WGPUCallbackMode_AllowProcessEvents;
         info.callback = on_mapped;
         info.userdata1 = &state;
-        wgpuBufferMapAsync(b->native.get(), WGPUMapMode_Read, 0, static_cast<size_t>(b->gpu_size), info);
+        wgpuBufferMapAsync(b->native.get(), WGPUMapMode_Read, lo, bytes, info);
         if (!pump([&] { return state.done; }, 10'000'000'000ull) || !state.ok) {
             report_error("Invalidate: readback map failed");
             return;
         }
-        if (const void* p = wgpuBufferGetConstMappedRange(b->native.get(), 0, static_cast<size_t>(b->gpu_size)))
-            std::memcpy(b->shadow.data(), p, b->shadow.size());
+        if (const void* p = wgpuBufferGetConstMappedRange(b->native.get(), lo, bytes))
+            std::memcpy(b->shadow.data() + lo, p, bytes);
         wgpuBufferUnmap(b->native.get());
     }
 
@@ -507,10 +548,24 @@ namespace conduit::webgpu {
 
     void webgpu_device::begin_frame() {
         frame_++;
+        {
+            // a per-frame group's contents not seen for two frames are not coming back
+            std::lock_guard lock(group_cache_mutex_);
+            group_cache_frame_ = frame_;
+            if (!group_cache_.empty())
+                std::erase_if(group_cache_, [&](const auto& kv) { return kv.second.used + 2 < frame_; });
+        }
         const uint64_t behind = (std::max)(1u, options_.frames_in_flight);
-        if (frame_ > behind)
+        if (frame_ > behind) {
+#if !defined(__EMSCRIPTEN__)
+            // sleep in the driver until that frame's last submission is done instead of polling every 50 us
+            const fence* f = fences_.get(frame_fence_);
+            const uint64_t index = frame_submissions_[(frame_ - behind) % frame_submissions_.size()];
+            if (f && index && f->value->load() < frame_ - behind)
+                wgpuDevicePoll(device_.get(), true, &index);
+#endif
             wait_fence(frame_fence_, frame_ - behind, 2'000'000'000ull);
-        else
+        } else
             pump([] { return true; }, 0);
 #if !defined(__EMSCRIPTEN__)
         wgpuInstanceProcessEvents(instance_.get());
@@ -527,6 +582,7 @@ namespace conduit::webgpu {
         info.callback = queue_done_for<fn>();
         info.userdata1 = new fence_signal{f->value, frame_};
         wgpuQueueOnSubmittedWorkDone(queue_.get(), info);
+        frame_submissions_[frame_ % frame_submissions_.size()] = last_submission_.load();
     }
 
     void webgpu_device::wait_idle() {
@@ -540,9 +596,21 @@ namespace conduit::webgpu {
 #endif
     }
 
+    device_stats webgpu_device::stats() const {
+        device_stats s;
+        counters_.fill(s);
+        s.buffer_bytes = static_cast<uint64_t>(std::max<int64_t>(0, buffer_bytes_));
+        s.texture_bytes = static_cast<uint64_t>(std::max<int64_t>(0, texture_bytes_));
+        s.live_buffers = static_cast<uint32_t>(std::max(0, live_buffers_.load()));
+        s.live_textures = static_cast<uint32_t>(std::max(0, live_textures_.load()));
+        s.live_pipelines = static_cast<uint32_t>(std::max(0, live_pipelines_.load()));
+        s.live_bind_groups = static_cast<uint32_t>(std::max(0, live_groups_.load()));
+        return s;
+    }
+
     memory_budget webgpu_device::query_memory_budget() {
         memory_budget m;
-        m.device_usage = stats_.buffer_bytes + stats_.texture_bytes;
+        m.device_usage = static_cast<uint64_t>(std::max<int64_t>(0, buffer_bytes_ + texture_bytes_));
         return m;
     }
 
@@ -561,14 +629,23 @@ namespace conduit::webgpu {
     }
 
     void webgpu_device::submit(queue_type, const submit_desc& desc) {
-        std::vector<WGPUCommandBuffer> commands;
+        thread_local std::vector<WGPUCommandBuffer> commands;
+        commands.clear();
         for (command_list* base : desc.lists) {
             auto* list = static_cast<webgpu_command_list*>(base);
+            counters_.add(list->counters());
             if (WGPUCommandBuffer cb = list->finish())
                 commands.push_back(cb);
         }
-        if (!commands.empty())
+        if (!commands.empty()) {
+#if defined(__EMSCRIPTEN__)
             wgpuQueueSubmit(queue_.get(), commands.size(), commands.data());
+#else
+            const uint64_t index = wgpuQueueSubmitForIndex(queue_.get(), commands.size(), commands.data());
+            uint64_t seen = last_submission_.load();
+            while (seen < index && !last_submission_.compare_exchange_weak(seen, index)) {}
+#endif
+        }
         for (WGPUCommandBuffer cb : commands)
             wgpuCommandBufferRelease(cb);
         {
@@ -576,7 +653,7 @@ namespace conduit::webgpu {
             for (command_list* base : desc.lists)
                 free_lists_.push_back(static_cast<webgpu_command_list*>(base));
         }
-        stats_.submits++;
+        counters_.count_submit();
 
         for (const fence_op& op : desc.signals) {
             fence* f = fences_.get(op.fence);
@@ -607,7 +684,6 @@ namespace conduit::webgpu {
         if (const auto it = texture.views.find(key); it != texture.views.end())
             return it->second.get();
         WGPUTextureViewDescriptor vd{};
-        vd.label = view("view");
         vd.format = format == conduit::format::unknown ? WGPUTextureFormat_Undefined : to_texture_format(format);
         vd.dimension = to_view_dimension(dim);
         vd.baseMipLevel = key.base_mip;
@@ -723,6 +799,11 @@ namespace conduit::webgpu {
             ld.entryCount = native.size();
             ld.entries = native.data();
             result->layout = owned<WGPUBindGroupLayout>(wgpuDeviceCreateBindGroupLayout(device_.get(), &ld));
+            if (result->layout && chosen.empty()) {
+                WGPUBindGroupDescriptor gd{};
+                gd.layout = result->layout.get();
+                result->blank = owned<WGPUBindGroup>(wgpuDeviceCreateBindGroup(device_.get(), &gd));
+            }
             return result;
         });
         if (!made || !made->layout)
@@ -734,6 +815,13 @@ namespace conduit::webgpu {
         WGPUBindGroupLayout raw = made->layout.get();
         wgpuBindGroupLayoutAddRef(raw);
         mine->layout = owned<WGPUBindGroupLayout>(raw);
+        // one blank group per cached layout, made with it rather than at first draw on a recording thread
+        if (made->blank) {
+            wgpuBindGroupAddRef(made->blank.get());
+            mine->blank = owned<WGPUBindGroup>(made->blank.get());
+        } else if (made->entries.empty()) {
+            return nullptr;
+        }
         return mine;
     }
 
@@ -741,9 +829,16 @@ namespace conduit::webgpu {
         bind_group* g = bind_groups_.get(handle);
         if (!g)
             return nullptr;
-        if (const auto it = g->native.find(set.layout.get()); it != g->native.end())
+        const WGPUBindGroupLayout layout = set.layout.get();
+        if (g->first_layout.load(std::memory_order_acquire) == layout)
+            return g->first.get();
+        std::lock_guard lock(group_locks_[handle.index() % group_locks_.size()]);
+        if (g->first_layout.load(std::memory_order_relaxed) == layout)
+            return g->first.get();
+        if (const auto it = g->others.find(layout); it != g->others.end())
             return it->second.get();
-        std::vector<WGPUBindGroupEntry> entries(set.entries.size());
+        thread_local std::vector<WGPUBindGroupEntry> entries;
+        entries.resize(set.entries.size());
         for (size_t i = 0; i < set.entries.size(); i++) {
             const bind_layout_entry& le = set.entries[i].rhi;
             WGPUBindGroupEntry& n = entries[i];
@@ -797,16 +892,69 @@ namespace conduit::webgpu {
             }
             }
         }
-        WGPUBindGroupDescriptor bd{};
-        bd.label = view("bind group");
-        bd.layout = set.layout.get();
-        bd.entryCount = entries.size();
-        bd.entries = entries.data();
-        WGPUBindGroup made = wgpuDeviceCreateBindGroup(device_.get(), &bd);
-        if (!made)
-            return nullptr;
-        g->native.emplace(set.layout.get(), owned<WGPUBindGroup>(made));
+        // per-frame groups usually repeat the contents of last frame's: those become a lookup
+        const uint64_t key = g->per_frame ? group_key(layout, entries) : 0;
+        WGPUBindGroup made = g->per_frame ? find_cached_group(key, layout, entries) : nullptr;
+        if (!made) {
+            WGPUBindGroupDescriptor bd{};
+            bd.layout = layout;
+            bd.entryCount = entries.size();
+            bd.entries = entries.data();
+            made = wgpuDeviceCreateBindGroup(device_.get(), &bd);
+            if (!made)
+                return nullptr;
+            if (g->per_frame)
+                cache_group(key, layout, entries, made);
+        }
+        if (!g->first) {
+            g->first = owned<WGPUBindGroup>(made);
+            g->first_layout.store(layout, std::memory_order_release);
+        } else {
+            g->others.emplace(layout, owned<WGPUBindGroup>(made));
+        }
         return made;
+    }
+
+    WGPUBindGroup webgpu_device::find_cached_group(uint64_t key, WGPUBindGroupLayout layout,
+                                                   std::span<const WGPUBindGroupEntry> entries) {
+        std::lock_guard lock(group_cache_mutex_);
+        const auto it = group_cache_.find(key);
+        if (it == group_cache_.end() || it->second.layout != layout || !same_entries(it->second.entries, entries))
+            return nullptr;
+        it->second.used = group_cache_frame_;
+        WGPUBindGroup group = it->second.group.get();
+        wgpuBindGroupAddRef(group);
+        return group;
+    }
+
+    void webgpu_device::cache_group(uint64_t key, WGPUBindGroupLayout layout,
+                                    std::span<const WGPUBindGroupEntry> entries, WGPUBindGroup group) {
+        constexpr size_t max_cached_groups = 4096;
+        std::lock_guard lock(group_cache_mutex_);
+        // a hash collision keeps the entry already there; the new group simply goes uncached
+        if (group_cache_.size() >= max_cached_groups || group_cache_.contains(key))
+            return;
+        cached_group c;
+        c.layout = layout;
+        c.entries.assign(entries.begin(), entries.end());
+        wgpuBindGroupAddRef(group);
+        c.group = owned<WGPUBindGroup>(group);
+        for (const WGPUBindGroupEntry& e : entries) {
+            if (e.buffer) {
+                wgpuBufferAddRef(e.buffer);
+                c.buffers.emplace_back(e.buffer);
+            }
+            if (e.textureView) {
+                wgpuTextureViewAddRef(e.textureView);
+                c.views.emplace_back(e.textureView);
+            }
+            if (e.sampler) {
+                wgpuSamplerAddRef(e.sampler);
+                c.samplers.emplace_back(e.sampler);
+            }
+        }
+        c.used = group_cache_frame_;
+        group_cache_.emplace(key, std::move(c));
     }
 
     texture_handle webgpu_device::create_surface_texture(conduit::format format, uint32_t width, uint32_t height,

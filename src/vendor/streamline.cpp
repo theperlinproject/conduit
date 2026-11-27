@@ -123,6 +123,7 @@ namespace conduit::vendor {
             streamline& owner_;
             upscale_desc desc_;
             bool options_dirty_ = true;
+            float pre_exposure_ = 1.0f;
         };
 
         class streamline final : public session, public frame_generator, public low_latency {
@@ -435,7 +436,8 @@ namespace conduit::vendor {
                 return false;
             const sl::ViewportHandle vp(viewport);
 
-            if (options_dirty_) {
+            // the exposure scale rides in the options, so a change in it has to be sent like any other
+            if (options_dirty_ || in.pre_exposure != pre_exposure_) {
                 sl::DLSSOptions o{};
                 switch (desc_.quality) {
                 case quality::native:
@@ -465,6 +467,7 @@ namespace conduit::vendor {
                 if (owner_.set_dlss_options_(vp, o) != sl::Result::eOk)
                     return false;
                 options_dirty_ = false;
+                pre_exposure_ = in.pre_exposure;
             }
 
             sl::Constants c = owner_.constants_for(in.camera, in.jitter_x, in.jitter_y, in.motion_scale_x,

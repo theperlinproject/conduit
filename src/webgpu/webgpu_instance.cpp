@@ -87,7 +87,7 @@ namespace conduit::webgpu {
             WGPUFeatureName_DepthClipControl,        WGPUFeatureName_Depth32FloatStencil8,
             WGPUFeatureName_TextureCompressionBC,    WGPUFeatureName_IndirectFirstInstance,
             WGPUFeatureName_RG11B10UfloatRenderable, WGPUFeatureName_Float32Filterable,
-            WGPUFeatureName_Float32Blendable,
+            WGPUFeatureName_Float32Blendable,        WGPUFeatureName_ShaderF16,
         };
 
         class webgpu_swapchain final : public swapchain {
@@ -335,6 +335,9 @@ namespace conduit::webgpu {
                     if (info.name.empty())
                         info.name = str(ai.description);
                     info.vendor_id = ai.vendorID;
+                    // wgpu's metal backend has no vendor id to give
+                    if (!info.vendor_id && ai.backendType == WGPUBackendType_Metal && info.name.starts_with("Apple"))
+                        info.vendor_id = vendor_id::apple;
                     info.device_id = ai.deviceID;
                     info.type = to_adapter_type(ai.adapterType);
                     info.driver_name = str(ai.description);
@@ -366,6 +369,10 @@ namespace conduit::webgpu {
                 for (WGPUFeatureName f : wanted_features)
                     if (wgpuAdapterHasFeature(adapter, f))
                         features.push_back(f);
+                for (WGPUNativeFeature f :
+                     {WGPUNativeFeature_MultiDrawIndirect, WGPUNativeFeature_MultiDrawIndirectCount})
+                    if (wgpuAdapterHasFeature(adapter, static_cast<WGPUFeatureName>(f)))
+                        features.push_back(static_cast<WGPUFeatureName>(f));
                 WGPULimits limits{};
                 wgpuAdapterGetLimits(adapter, &limits);
 

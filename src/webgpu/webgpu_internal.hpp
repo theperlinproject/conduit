@@ -1,5 +1,6 @@
 #pragma once
 #include "backends.hpp"
+#include "common/counters.hpp"
 #include "common/handle_pool.hpp"
 #include "common/shader_reflect.hpp"
 #include "common/util.hpp"
@@ -195,10 +196,42 @@ namespace conduit::webgpu {
         std::vector<bind_layout_entry> entries;
     };
 
+    // native groups are made at first bind, from whichever thread records it: the usual single native layout
+    // is published lock free, making one and further layouts take one of the device's group locks
     struct bind_group {
         bind_layout_handle layout;
         std::vector<bind_group_entry> entries;
-        std::map<WGPUBindGroupLayout, owned<WGPUBindGroup>> native;
+        bool per_frame = false;
+        std::atomic<WGPUBindGroupLayout> first_layout{nullptr};
+        owned<WGPUBindGroup> first;
+        std::map<WGPUBindGroupLayout, owned<WGPUBindGroup>> others;
+
+        bind_group() = default;
+        bind_group(bind_group&& o) noexcept
+            : layout(o.layout), entries(std::move(o.entries)), per_frame(o.per_frame),
+              first_layout(o.first_layout.load(std::memory_order_relaxed)), first(std::move(o.first)),
+              others(std::move(o.others)) {}
+        bind_group& operator=(bind_group&& o) noexcept {
+            layout = o.layout;
+            entries = std::move(o.entries);
+            per_frame = o.per_frame;
+            first_layout.store(o.first_layout.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            first = std::move(o.first);
+            others = std::move(o.others);
+            return *this;
+        }
+    };
+
+    // a native group of a per-frame bind group, kept for the next frame's group with the same contents. it holds
+    // a reference on each resource it names, so no new object can take one of those addresses while it lives
+    struct cached_group {
+        WGPUBindGroupLayout layout = nullptr;
+        std::vector<WGPUBindGroupEntry> entries;
+        owned<WGPUBindGroup> group;
+        std::vector<owned<WGPUBuffer>> buffers;
+        std::vector<owned<WGPUTextureView>> views;
+        std::vector<owned<WGPUSampler>> samplers;
+        uint64_t used = 0;
     };
 
     struct pipeline_layout {
@@ -227,6 +260,9 @@ namespace conduit::webgpu {
         std::array<std::shared_ptr<native_set>, max_bind_groups> sets;
         uint32_t stream_count = 0;
         uint32_t set_count = 0;
+        // stride of the single per-vertex stream when the vertex shader never reads vertex_index: a new offset
+        // into the same buffer can then move first_vertex instead of rebinding the buffer
+        uint32_t shift_stride = 0;
     };
 
     struct query {
@@ -280,18 +316,23 @@ namespace conduit::webgpu {
                                          uint64_t count_offset, uint32_t max_draws, uint32_t stride) override;
         void dispatch(uint32_t x, uint32_t y, uint32_t z) override;
         void dispatch_indirect(buffer_handle args, uint64_t offset) override;
+        bool prepare_dispatch();
         void write_timestamp(query_set_handle set, uint32_t index) override;
         void resolve_queries(query_set_handle set, uint32_t first, uint32_t count, buffer_handle dst,
                              uint64_t dst_offset) override;
         void begin_debug_label(const char* name, uint32_t rgba) override;
         void end_debug_label() override;
         void* native_handle() override { return encoder_.get(); }
-        void invalidate_bound_state() override { dirty_sets_ = 0xF; }
+        void invalidate_bound_state() override;
+        const list_counters& counters() const { return counters_; }
 
     private:
         void end_pass();
-        void flush_bindings();
+        void forget_sent();
         bool prepare_draw();
+        bool set_native_group(uint32_t set, const native_set* ns);
+        void bind_index_buffer(const buffer& b);
+        bool unshift_vertices();
 
         webgpu_device& device_;
         queue_type queue_;
@@ -307,24 +348,41 @@ namespace conduit::webgpu {
         std::array<bound_set, max_bind_groups> sets_{};
         uint32_t dirty_sets_ = 0;
         bool pipeline_dirty_ = true;
+        // what the open pass was last given: webgpu keeps groups bound across setPipeline, and a call equal to
+        // the last one is dropped. groups are matched by handle and native layout, never by the raw pointer of
+        // a group that may since have been freed and its address reused
+        struct sent_set {
+            bind_group_handle group;
+            WGPUBindGroupLayout layout = nullptr;
+            WGPUBindGroup native = nullptr;
+            std::array<uint32_t, max_dynamic_offsets> offsets{};
+            uint32_t offset_count = 0;
+        };
+        std::array<sent_set, max_bind_groups> sent_sets_{};
         struct vertex_slot {
             buffer_handle buffer;
             uint64_t offset = 0;
+            bool operator==(const vertex_slot&) const = default;
         };
-        std::array<vertex_slot, max_vertex_streams> vertex_{};
+        std::array<vertex_slot, max_vertex_streams> vertex_{}, sent_vertex_{};
         uint32_t vertex_dirty_ = 0;
+        uint32_t vertex_shift_ = 0;
         buffer_handle index_buffer_;
         index_type index_type_ = index_type::u32;
         uint64_t index_offset_ = 0;
         bool index_dirty_ = false;
-        viewport viewport_;
-        bool viewport_set_ = false, viewport_dirty_ = false;
-        rect scissor_;
-        bool scissor_set_ = false, scissor_dirty_ = false;
+        buffer_handle sent_index_buffer_;
+        index_type sent_index_type_ = index_type::u32;
+        uint64_t sent_index_offset_ = 0;
+        viewport viewport_, sent_viewport_;
+        bool viewport_set_ = false, viewport_dirty_ = false, viewport_sent_ = false;
+        rect scissor_, sent_scissor_;
+        bool scissor_set_ = false, scissor_dirty_ = false, scissor_sent_ = false;
         uint32_t stencil_ref_ = 0;
         bool stencil_dirty_ = false;
         uint32_t pass_width_ = 0, pass_height_ = 0;
         bool warned_push_ = false;
+        list_counters counters_;
     };
 
     class webgpu_device final : public device {
@@ -387,7 +445,7 @@ namespace conduit::webgpu {
         void wait_idle() override;
 
         memory_budget query_memory_budget() override;
-        device_stats stats() const override { return stats_; }
+        device_stats stats() const override;
         float timestamp_period_ns() const override { return 1.0f; }
 
         WGPUDevice dev() const { return device_.get(); }
@@ -395,7 +453,6 @@ namespace conduit::webgpu {
         WGPUInstance inst() const { return instance_.get(); }
         WGPUAdapter adapter() const { return adapter_.get(); }
         const device_options& options() const { return options_; }
-        device_stats& mutable_stats() { return stats_; }
         bool pump(const std::function<bool()>& done, uint64_t timeout_ns);
         void report_error(const std::string& message);
 
@@ -427,6 +484,10 @@ namespace conduit::webgpu {
         void fill_caps();
         std::shared_ptr<native_set> cached_layout(const std::string& key,
                                                   const std::function<std::shared_ptr<native_set>()>& make);
+        WGPUBindGroup find_cached_group(uint64_t key, WGPUBindGroupLayout layout,
+                                        std::span<const WGPUBindGroupEntry> entries);
+        void cache_group(uint64_t key, WGPUBindGroupLayout layout, std::span<const WGPUBindGroupEntry> entries,
+                         WGPUBindGroup group);
 
         owned<WGPUInstance> instance_;
         owned<WGPUAdapter> adapter_;
@@ -437,16 +498,25 @@ namespace conduit::webgpu {
         owned<WGPUBindGroup> empty_group_;
         device_options options_;
         device_caps caps_;
-        device_stats stats_;
+        device_counters counters_;
+        std::atomic<int64_t> buffer_bytes_{0}, texture_bytes_{0};
+        std::atomic<int32_t> live_buffers_{0}, live_textures_{0}, live_pipelines_{0}, live_groups_{0};
         bool map_sync_ = true;
         uint64_t frame_ = 0;
         fence_handle frame_fence_;
         std::atomic<uint64_t> submitted_frames_{0};
+        // native only: the last submission of each frame in flight, to block on exactly that one
+        std::atomic<uint64_t> last_submission_{0};
+        std::vector<uint64_t> frame_submissions_;
         std::vector<std::unique_ptr<webgpu_command_list>> lists_;
         std::vector<webgpu_command_list*> free_lists_;
         std::mutex list_mutex_;
         std::mutex layout_mutex_;
         std::unordered_map<std::string, std::shared_ptr<native_set>> layout_cache_;
+        std::array<std::mutex, 16> group_locks_;
+        std::mutex group_cache_mutex_;
+        std::unordered_map<uint64_t, cached_group> group_cache_;
+        uint64_t group_cache_frame_ = 0;
         std::mutex error_mutex_;
         std::string first_error_;
         bool has_feature_timestamp_ = false;

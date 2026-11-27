@@ -66,6 +66,8 @@ namespace conduit::vk {
         uint32_t layers = 1;
         bool external = false;
         std::unordered_map<uint64_t, VkImageView> views;
+        // the full view of its own type and format, made with the texture, so bind groups take it without the lock
+        VkImageView default_view = VK_NULL_HANDLE;
     };
 
     struct sampler_rec {
@@ -73,8 +75,12 @@ namespace conduit::vk {
         sampler_desc desc;
     };
 
+    // shared with the pipeline jobs still compiling from it, so destroying the shader or layout never waits for
+    // the compile queue; a pipeline keeps its layout too, since binding sets with it needs the layout alive
+    template <class T> using shared_vk = std::shared_ptr<const T>;
+
     struct shader_rec {
-        VkShaderModule module = VK_NULL_HANDLE;
+        shared_vk<VkShaderModule> module;
         shader_stage stage = shader_stage::vertex;
         std::string entry;
     };
@@ -96,6 +102,7 @@ namespace conduit::vk {
 
     struct pipeline_layout_rec {
         VkPipelineLayout layout = VK_NULL_HANDLE;
+        shared_vk<VkPipelineLayout> owner;
         VkShaderStageFlags push_stages = 0;
         uint32_t push_bytes = 0;
         std::array<bind_layout_handle, max_bind_groups> sets{};
@@ -119,6 +126,7 @@ namespace conduit::vk {
         VkPipelineBindPoint bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
         pipeline_layout_handle layout_handle;
         VkPipelineLayout layout = VK_NULL_HANDLE;
+        shared_vk<VkPipelineLayout> layout_owner;
         VkShaderStageFlags push_stages = 0;
         uint32_t push_bytes = 0;
         uint32_t color_count = 0;
@@ -189,13 +197,14 @@ namespace conduit::vk {
 
     class cmd_list final : public command_list {
     public:
-        cmd_list(vk::device& device, queue_type queue, VkCommandBuffer cmd)
-            : device_(device), queue_(queue), cmd_(cmd) {}
+        cmd_list(vk::device& device, queue_type queue, VkCommandPool pool, VkCommandBuffer cmd)
+            : device_(device), queue_(queue), pool_(pool), cmd_(cmd) {}
 
         queue_type queue() const override { return queue_; }
         void begin();
         void end();
         VkCommandBuffer cmd() const { return cmd_; }
+        VkCommandPool pool() const { return pool_; }
 
         void barrier(std::span<const texture_barrier> textures, std::span<const buffer_barrier> buffers) override;
         void uav_barrier(buffer_handle buffer) override;
@@ -250,6 +259,7 @@ namespace conduit::vk {
         std::vector<VkImageMemoryBarrier2> barrier_images_;
         std::vector<VkBufferMemoryBarrier2> barrier_buffers_;
         queue_type queue_;
+        VkCommandPool pool_;
         VkCommandBuffer cmd_;
 
         pipeline_rec pipeline_;
@@ -259,6 +269,10 @@ namespace conduit::vk {
         std::array<bind_group_handle, max_bind_groups> groups_{};
         std::array<std::array<uint32_t, max_dynamic_offsets>, max_bind_groups> dynamic_offsets_{};
         std::array<uint32_t, max_bind_groups> dynamic_counts_{};
+        // the native set behind each bound group and which sets the bound layout uses, taken when they are
+        // bound so a draw never looks a group or layout up again
+        std::array<VkDescriptorSet, max_bind_groups> native_sets_{};
+        uint32_t layout_sets_ = 0xFu;
         uint32_t dirty_sets_ = 0;
         std::array<uint8_t, max_push_constant_bytes> push_{};
         bool push_dirty_ = false;
@@ -280,15 +294,24 @@ namespace conduit::vk {
         VkDeviceSize ioffset_ = 0;
         VkIndexType itype_ = VK_INDEX_TYPE_UINT32;
         uint32_t stencil_ref_ = 0;
+        bool have_stencil_ref_ = false;
     };
 
+    // each list has its own command pool: a list acquired on one thread may be recorded on another, and two lists
+    // recorded at the same time must not share the pool vulkan makes them synchronize on. per-frame bind groups
+    // come from the creating thread's own descriptor pools, so making them takes no device lock
     struct thread_pools {
         struct per_queue {
-            VkCommandPool pool = VK_NULL_HANDLE;
             std::vector<std::unique_ptr<cmd_list>> lists;
             size_t used = 0;
         };
+        struct frame_descriptors {
+            std::vector<VkDescriptorPool> pools;
+            size_t used = 0;
+            std::vector<bind_group_handle> groups;
+        };
         std::vector<std::array<per_queue, queue_count>> slots;
+        std::vector<frame_descriptors> descriptors;
     };
 
     class swapchain;
@@ -381,7 +404,6 @@ namespace conduit::vk {
                                        uint32_t height);
         VkQueue present_queue() const { return queues_[0].queue; }
         VkPipeline ready_pipeline(const pipeline_rec& p);
-        void drain_pipeline_jobs();
         std::mutex* present_mutex() const { return queues_[0].mutex; }
 
     private:
@@ -430,7 +452,8 @@ namespace conduit::vk {
         thread_pools& pools_for_this_thread();
         void reset_slot(uint32_t s);
         VkDescriptorPool new_descriptor_pool(bool freeable);
-        VkDescriptorSet allocate_set(VkDescriptorSetLayout layout, bool per_frame, VkDescriptorPool& pool_out);
+        VkDescriptorSet allocate_set(VkDescriptorSetLayout layout, thread_pools::frame_descriptors* frame,
+                                     VkDescriptorPool& pool_out);
         void fill_caps(const adapter_info& adapter);
 
         std::shared_ptr<timeline> make_timeline(uint64_t initial);
@@ -451,6 +474,17 @@ namespace conduit::vk {
         std::vector<std::pair<render_pass_key, VkRenderPass>> render_passes_;
         std::mutex framebuffer_mutex_;
         std::vector<std::vector<VkFramebuffer>> slot_framebuffers_;
+        // render-pass targets repeat every frame: their framebuffers are kept instead of made per pass
+        struct cached_framebuffer {
+            VkRenderPass pass = VK_NULL_HANDLE;
+            std::array<VkImageView, max_color_targets + 1> views{};
+            uint32_t count = 0, width = 0, height = 0;
+            VkFramebuffer framebuffer = VK_NULL_HANDLE;
+            uint64_t used = 0;
+        };
+        std::vector<cached_framebuffer> framebuffer_cache_;
+        // drops every kept framebuffer that uses one of these views, before the views go away
+        void forget_framebuffers(const std::vector<VkImageView>& views);
 
         std::mutex view_mutex_;
         std::mutex sampler_mutex_;
@@ -466,24 +500,24 @@ namespace conduit::vk {
 
         std::mutex descriptor_mutex_;
         std::vector<VkDescriptorPool> persistent_pools_;
-        struct frame_descriptors {
-            std::vector<VkDescriptorPool> pools;
-            size_t used = 0;
-            std::vector<bind_group_handle> groups;
-        };
-        std::vector<frame_descriptors> frame_descriptors_;
+        size_t persistent_current_ = 0;
 
         std::mutex pools_mutex_;
         std::unordered_map<std::thread::id, std::unique_ptr<thread_pools>> thread_pools_;
+        // tells a thread's cached pools apart from those of an earlier device at the same address
+        const uint64_t instance_id_ = next_instance_id();
+        static uint64_t next_instance_id() {
+            static std::atomic<uint64_t> next{1};
+            return next.fetch_add(1, std::memory_order_relaxed);
+        }
 
         struct pipeline_job;
         void run_pipeline_job(pipeline_job& job);
         void compile_worker();
         std::mutex compile_mutex_;
-        std::condition_variable compile_wake_, compile_idle_;
+        std::condition_variable compile_wake_;
         std::deque<std::shared_ptr<pipeline_job>> compile_queue_;
         std::vector<std::thread> compile_threads_;
-        uint32_t compile_running_ = 0;
         bool compile_stop_ = false;
         std::atomic<uint64_t> pipelines_pending_{0};
 

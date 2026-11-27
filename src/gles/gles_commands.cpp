@@ -1,8 +1,10 @@
 #include "gles/gles_internal.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 namespace conduit::gles {
     namespace {
@@ -32,7 +34,6 @@ namespace conduit::gles {
             op_draw,
             op_draw_indexed,
             op_draw_indexed_indirect,
-            op_draw_indexed_indirect_count,
             op_dispatch,
             op_dispatch_indirect,
             op_resolve_queries,
@@ -165,6 +166,8 @@ namespace conduit::gles {
     // ---------------------------------------------------------------- recording
 
     void cmd_list::begin() {
+        if (stream_.capacity() == 0)
+            stream_ = device_.take_stream();
         stream_.clear();
         counters_ = {};
     }
@@ -284,10 +287,10 @@ namespace conduit::gles {
         emit(op_draw_indexed_indirect, p_indirect{args, offset, max_draws, stride});
     }
 
+    // there is no GPU-side count in OpenGL ES: every slot runs, and the culling shader zeroes the ones it drops
     void cmd_list::draw_indexed_indirect_count(buffer_handle args, uint64_t offset, buffer_handle, uint64_t,
                                                uint32_t max_draws, uint32_t stride) {
-        counters_.indirect++;
-        emit(op_draw_indexed_indirect_count, p_indirect{args, offset, max_draws, stride});
+        draw_indexed_indirect(args, offset, max_draws, stride);
     }
 
     void cmd_list::dispatch(uint32_t x, uint32_t y, uint32_t z) {
@@ -330,6 +333,9 @@ namespace conduit::gles {
             cache_.array_buffer = ~0u;
         if (cache_.element_buffer == gl)
             cache_.element_buffer = ~0u;
+        for (range_binding& r : cache_.uniform_ranges)
+            if (r.buffer == gl)
+                r = range_binding{};
     }
 
     void device::resync() {
@@ -530,10 +536,9 @@ namespace conduit::gles {
                     break;
                 case op_vertex_buffer: {
                     const auto a = take<p_vertex>(p, bytes);
-                    if (a.slot < vertex_.size()) {
+                    // the arrays are only specified again when the next draw cannot reach the new offset
+                    if (a.slot < vertex_.size())
                         vertex_[a.slot] = {a.buffer, a.offset};
-                        attribs_dirty_ = true;
-                    }
                     break;
                 }
                 case op_index_buffer: {
@@ -557,11 +562,6 @@ namespace conduit::gles {
                 case op_draw_indexed_indirect:
                     draw_indirect(take<p_indirect>(p, bytes));
                     break;
-                case op_draw_indexed_indirect_count:
-                    bytes = sizeof(p_indirect);
-                    dev_.report_once(
-                        "draw_indexed_indirect_count is not available in OpenGL ES: the draws are skipped");
-                    break;
                 case op_dispatch: {
                     const auto a = take<p_dispatch>(p, bytes);
                     if (prepare_dispatch())
@@ -582,10 +582,9 @@ namespace conduit::gles {
                     break;
                 case op_debug_begin: {
                     const auto a = take<p_u32>(p, bytes);
-                    if (dev_.features().debug_groups) {
-                        const std::string name(reinterpret_cast<const char*>(p + bytes), a.value);
-                        gl_.glPushDebugGroup(0x824A, 0, static_cast<GLsizei>(name.size()), name.c_str());
-                    }
+                    if (dev_.features().debug_groups)
+                        gl_.glPushDebugGroup(0x824A, 0, static_cast<GLsizei>(a.value),
+                                             reinterpret_cast<const char*>(p + bytes));
                     break;
                 }
                 case op_debug_end:
@@ -1097,12 +1096,27 @@ namespace conduit::gles {
                 if (!clearing)
                     return;
 
-                // clears honour the scissor test and the write masks: open both up, and make the next draw set its own
+                // clears honour the scissor test and the write masks: open both up, and note it so the next draw only
+                // sets the masks back
                 dev_.use_scissor_test(false);
-                gl_.glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                gl_.glDepthMask(GL_TRUE);
-                gl_.glStencilMaskSeparate(GL_FRONT_AND_BACK, 0xFF);
-                cache_.state_valid = false;
+                pipeline_state& c = cache_.state;
+                const bool known = cache_.state_valid;
+                bool colors_open = known && c.blend_count && c.blend[0].mask == 15;
+                if (colors_open && dev_.features().indexed_blend) {
+                    colors_open = c.blend_count >= desc_.color_count;
+                    for (uint32_t i = 0; i < c.blend_count; i++)
+                        colors_open = colors_open && c.blend[i].mask == 15;
+                }
+                if (!colors_open)
+                    gl_.glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                if (!known || !c.depth_write)
+                    gl_.glDepthMask(GL_TRUE);
+                if (!known || c.stencil_write != 0xFF)
+                    gl_.glStencilMaskSeparate(GL_FRONT_AND_BACK, 0xFF);
+                for (uint32_t i = 0; i < c.blend_count; i++)
+                    c.blend[i].mask = 15;
+                c.depth_write = true;
+                c.stencil_write = 0xFF;
                 for (uint32_t i = 0; i < desc_.color_count; i++) {
                     const color_attachment& c = desc_.colors[i];
                     if (c.load != load_op::clear)
@@ -1158,7 +1172,7 @@ namespace conduit::gles {
                         discard[discards++] = GL_COLOR_ATTACHMENT0 + i;
                 }
                 if (const texture* depth = dev_.texture_of(desc_.depth.texture))
-                    if (desc_.depth.store == store_op::dont_care || desc_.depth.read_only)
+                    if (desc_.depth.store == store_op::dont_care)
                         discard[discards++] =
                             has_stencil(depth->desc.format) ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
                 if (discards) {
@@ -1191,8 +1205,13 @@ namespace conduit::gles {
                 // the pass renders upside down, so window rows are image rows and the viewport maps straight across
                 const float h = std::fabs(viewport_.height);
                 const float y = viewport_.height < 0 ? viewport_.y + viewport_.height : viewport_.y;
-                gl_.glViewport(static_cast<GLint>(viewport_.x), static_cast<GLint>(y),
-                               static_cast<GLsizei>(viewport_.width), static_cast<GLsizei>(h));
+                const std::array<GLint, 4> r = {static_cast<GLint>(viewport_.x), static_cast<GLint>(y),
+                                                static_cast<GLsizei>(viewport_.width), static_cast<GLsizei>(h)};
+                if (!cache_.viewport_valid || cache_.viewport_rect != r) {
+                    cache_.viewport_rect = r;
+                    cache_.viewport_valid = true;
+                    gl_.glViewport(r[0], r[1], r[2], r[3]);
+                }
                 if (cache_.depth_near != viewport_.min_depth || cache_.depth_far != viewport_.max_depth) {
                     cache_.depth_near = viewport_.min_depth;
                     cache_.depth_far = viewport_.max_depth;
@@ -1208,8 +1227,13 @@ namespace conduit::gles {
 
             void apply_scissor() {
                 dev_.use_scissor_test(true);
-                gl_.glScissor(scissor_.x, scissor_.y, static_cast<GLsizei>(scissor_.width),
-                              static_cast<GLsizei>(scissor_.height));
+                const std::array<GLint, 4> r = {scissor_.x, scissor_.y, static_cast<GLsizei>(scissor_.width),
+                                                static_cast<GLsizei>(scissor_.height)};
+                if (!cache_.scissor_valid || cache_.scissor_rect != r) {
+                    cache_.scissor_rect = r;
+                    cache_.scissor_valid = true;
+                    gl_.glScissor(r[0], r[1], r[2], r[3]);
+                }
             }
 
             // ------------------------------------------------ pipeline state
@@ -1305,28 +1329,44 @@ namespace conduit::gles {
                 if (dev_.features().indexed_blend) {
                     for (uint32_t i = 0; i < e.blend_count; i++) {
                         const blend_gl& n = e.blend[i];
-                        if (!all && i < o.blend_count && o.blend[i] == n)
+                        const bool known = !all && i < o.blend_count;
+                        if (known && o.blend[i] == n)
                             continue;
-                        if (n.enable)
-                            gl_.glEnablei(GL_BLEND, i);
-                        else
-                            gl_.glDisablei(GL_BLEND, i);
-                        gl_.glBlendFuncSeparatei(i, n.src_rgb, n.dst_rgb, n.src_alpha, n.dst_alpha);
-                        gl_.glBlendEquationSeparatei(i, n.op_rgb, n.op_alpha);
-                        gl_.glColorMaski(i, n.mask & 1, (n.mask >> 1) & 1, (n.mask >> 2) & 1, (n.mask >> 3) & 1);
+                        const blend_gl& b = o.blend[i];
+                        if (!known || b.enable != n.enable) {
+                            if (n.enable)
+                                gl_.glEnablei(GL_BLEND, i);
+                            else
+                                gl_.glDisablei(GL_BLEND, i);
+                        }
+                        if (!known || b.src_rgb != n.src_rgb || b.dst_rgb != n.dst_rgb || b.src_alpha != n.src_alpha ||
+                            b.dst_alpha != n.dst_alpha)
+                            gl_.glBlendFuncSeparatei(i, n.src_rgb, n.dst_rgb, n.src_alpha, n.dst_alpha);
+                        if (!known || b.op_rgb != n.op_rgb || b.op_alpha != n.op_alpha)
+                            gl_.glBlendEquationSeparatei(i, n.op_rgb, n.op_alpha);
+                        if (!known || b.mask != n.mask)
+                            gl_.glColorMaski(i, n.mask & 1, (n.mask >> 1) & 1, (n.mask >> 2) & 1, (n.mask >> 3) & 1);
                     }
                     return;
                 }
                 const blend_gl& n = e.blend[0];
-                if (!all && o.blend_count && o.blend[0] == n)
+                const bool known = !all && o.blend_count;
+                const blend_gl& b = o.blend[0];
+                if (known && b == n)
                     return;
-                if (n.enable)
-                    gl_.glEnable(GL_BLEND);
-                else
-                    gl_.glDisable(GL_BLEND);
-                gl_.glBlendFuncSeparate(n.src_rgb, n.dst_rgb, n.src_alpha, n.dst_alpha);
-                gl_.glBlendEquationSeparate(n.op_rgb, n.op_alpha);
-                gl_.glColorMask(n.mask & 1, (n.mask >> 1) & 1, (n.mask >> 2) & 1, (n.mask >> 3) & 1);
+                if (!known || b.enable != n.enable) {
+                    if (n.enable)
+                        gl_.glEnable(GL_BLEND);
+                    else
+                        gl_.glDisable(GL_BLEND);
+                }
+                if (!known || b.src_rgb != n.src_rgb || b.dst_rgb != n.dst_rgb || b.src_alpha != n.src_alpha ||
+                    b.dst_alpha != n.dst_alpha)
+                    gl_.glBlendFuncSeparate(n.src_rgb, n.dst_rgb, n.src_alpha, n.dst_alpha);
+                if (!known || b.op_rgb != n.op_rgb || b.op_alpha != n.op_alpha)
+                    gl_.glBlendEquationSeparate(n.op_rgb, n.op_alpha);
+                if (!known || b.mask != n.mask)
+                    gl_.glColorMask(n.mask & 1, (n.mask >> 1) & 1, (n.mask >> 2) & 1, (n.mask >> 3) & 1);
             }
 
             // ------------------------------------------------ descriptors
@@ -1335,12 +1375,14 @@ namespace conduit::gles {
                 if (a.set >= max_bind_groups)
                     return;
                 bound& b = sets_[a.set];
+                // a new dynamic offset leaves the textures where they are
+                if (!(b.group == a.group))
+                    samplers_dirty_ = true;
                 b.group = a.group;
                 b.offset_count = std::min<uint32_t>(a.count, max_dynamic_offsets);
                 for (uint32_t i = 0; i < b.offset_count; i++)
                     std::memcpy(&b.offsets[i], offsets + i * 4, 4);
                 sets_dirty_ |= 1u << a.set;
-                samplers_dirty_ = true;
             }
 
             void bind_buffers(uint32_t set, const pipeline_layout& layout) {
@@ -1403,13 +1445,15 @@ namespace conduit::gles {
                 size = std::max<uint64_t>(size, 16);
                 const uint64_t alignment = std::max<uint32_t>(dev_.caps().limits.uniform_buffer_alignment, 1);
                 const bool upload_class = !buf.shadow.empty() && buf.desc.memory != memory_class::readback;
+                // a buffer the application flushes is brought across by its flushes
+                const bool from_shadow = upload_class && !buf.flushed;
                 GLuint source = buf.gl;
                 GLintptr at = static_cast<GLintptr>(offset);
                 if (offset % alignment != 0) {
                     // an offset GL cannot bind at: bind a copy
                     const uint64_t slot = dev_.push_alloc(static_cast<uint32_t>(align_up(size, 16)));
                     gl_.glBindBuffer(GL_COPY_WRITE_BUFFER, dev_.push_ring());
-                    if (upload_class) {
+                    if (from_shadow) {
                         gl_.glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(slot),
                                             static_cast<GLsizeiptr>(size), buf.shadow.data() + offset);
                     } else {
@@ -1420,13 +1464,23 @@ namespace conduit::gles {
                     }
                     source = dev_.push_ring();
                     at = static_cast<GLintptr>(slot);
-                } else if (upload_class) {
+                } else if (from_shadow) {
                     // what the application wrote is in the shadow: constant data is small, so it goes up every time
                     gl_.glBindBuffer(GL_COPY_WRITE_BUFFER, buf.gl);
                     gl_.glBufferSubData(GL_COPY_WRITE_BUFFER, at, static_cast<GLsizeiptr>(size),
                                         buf.shadow.data() + offset);
                 }
-                gl_.glBindBufferRange(GL_UNIFORM_BUFFER, index, source, at, static_cast<GLsizeiptr>(size));
+                bind_uniform_range(index, source, at, static_cast<GLsizeiptr>(size));
+            }
+
+            void bind_uniform_range(uint32_t index, GLuint buffer, GLintptr at, GLsizeiptr size) {
+                if (index < cache_.uniform_ranges.size()) {
+                    range_binding& r = cache_.uniform_ranges[index];
+                    if (r.buffer == buffer && r.offset == at && r.size == size)
+                        return;
+                    r = {buffer, at, size};
+                }
+                gl_.glBindBufferRange(GL_UNIFORM_BUFFER, index, buffer, at, size);
             }
 
             // the preferred sampler object for a texture: GL leaves filtered reads of depth, integer and wide float
@@ -1448,15 +1502,18 @@ namespace conduit::gles {
                     const bind_group_entry* te = g ? g->find(c.binding) : nullptr;
                     texture* t = te ? dev_.texture_of(te->texture.texture) : nullptr;
                     if (!t || t->renderbuffer) {
-                        dev_.use_texture(c.unit, c.target, 0);
+                        dev_.sample_texture(c.unit, c.target, 0);
                         continue;
                     }
-                    dev_.use_texture(c.unit, t->target, t->gl);
+                    dev_.sample_texture(c.unit, t->target, t->gl);
                     const subresource_range& range = te->texture.range;
                     const int base = static_cast<int>(std::min<uint32_t>(range.base_mip, t->levels - 1));
                     const int last = range.mip_count
                                          ? std::min(base + static_cast<int>(range.mip_count) - 1, t->levels - 1)
                                          : t->levels - 1;
+                    if (t->base_level != base || t->max_level != last)
+                        // texture parameters go to the active unit's texture
+                        dev_.use_texture(c.unit, t->target, t->gl);
                     if (t->base_level != base) {
                         gl_.glTexParameteri(t->target, GL_TEXTURE_BASE_LEVEL, base);
                         t->base_level = base;
@@ -1499,8 +1556,8 @@ namespace conduit::gles {
                     gl_.glBindBuffer(GL_COPY_WRITE_BUFFER, dev_.push_ring());
                     gl_.glBufferSubData(GL_COPY_WRITE_BUFFER, static_cast<GLintptr>(at), static_cast<GLsizeiptr>(bytes),
                                         push_.data());
-                    gl_.glBindBufferRange(GL_UNIFORM_BUFFER, layout->push_slot, dev_.push_ring(),
-                                          static_cast<GLintptr>(at), static_cast<GLsizeiptr>(bytes));
+                    bind_uniform_range(layout->push_slot, dev_.push_ring(), static_cast<GLintptr>(at),
+                                       static_cast<GLsizeiptr>(bytes));
                     push_dirty_ = false;
                 }
                 return true;
@@ -1511,6 +1568,7 @@ namespace conduit::gles {
             void set_arrays(int64_t base_vertex, int64_t base_instance) {
                 gl_cache& c = cache_;
                 uint32_t used = 0;
+                bool dropped = false;
                 for (uint32_t i = 0; i < pipeline_->attribute_count; i++) {
                     const vertex_attribute_gl& a = pipeline_->attributes[i];
                     const buffer* b = dev_.buffer_of(vertex_[a.stream].buffer);
@@ -1522,8 +1580,10 @@ namespace conduit::gles {
                     const int64_t base = per_instance ? base_instance : base_vertex;
                     const int64_t offset =
                         static_cast<int64_t>(vertex_[a.stream].offset) + a.offset + base * stream.stride;
-                    if (offset < 0)
+                    if (offset < 0) {
+                        dropped = true;
                         continue;
+                    }
                     used |= 1u << a.location;
                     attrib_state& s = c.attribs[a.location];
                     const GLuint divisor = per_instance ? 1 : 0;
@@ -1565,12 +1625,74 @@ namespace conduit::gles {
                         gl_.glDisableVertexAttribArray(l);
                         c.enabled_attribs &= ~(1u << l);
                     }
+                applied_vertex_ = vertex_;
                 applied_base_vertex_ = base_vertex;
                 applied_base_instance_ = base_instance;
-                attribs_dirty_ = false;
+                // an attribute left out for a negative offset may be wanted by the next draw
+                attribs_dirty_ = dropped;
             }
 
-            bool prepare_draw(int64_t base_vertex, int64_t base_instance) {
+            // how a draw can reach vertices the arrays were not specified for
+            enum class shift_by { none, first_vertex, base_vertex };
+
+            // whether the arrays as last specified serve a draw once its vertices are moved by `shift`: every vertex
+            // stream must have moved by the same whole number of vertices, and nothing else may have changed
+            bool arrays_reach(int64_t base_vertex, int64_t base_instance, shift_by how, int64_t first,
+                              int64_t& shift) const {
+                if (attribs_dirty_ || base_instance != applied_base_instance_)
+                    return false;
+                int64_t moved = 0;
+                bool any = false;
+                for (uint32_t mask = pipeline_->stream_mask; mask; mask &= mask - 1) {
+                    const auto s = static_cast<uint32_t>(std::countr_zero(mask));
+                    const vertex_slot& now = vertex_[s];
+                    const vertex_slot& then = applied_vertex_[s];
+                    if (!(now.buffer == then.buffer))
+                        return false;
+                    const int64_t delta = static_cast<int64_t>(now.offset) - static_cast<int64_t>(then.offset);
+                    const int64_t stride = pipeline_->streams[s].stride;
+                    if (pipeline_->streams[s].step == vertex_step::instance || stride == 0) {
+                        if (delta != 0)
+                            return false;
+                        continue;
+                    }
+                    // set_arrays leaves out attributes that would start before the buffer
+                    if (static_cast<int64_t>(now.offset) + base_vertex * stride < 0 || delta % stride != 0)
+                        return false;
+                    if (any && delta / stride != moved)
+                        return false;
+                    moved = delta / stride;
+                    any = true;
+                }
+                shift = moved + base_vertex - applied_base_vertex_;
+                if (shift == 0)
+                    return true;
+                if (how == shift_by::none)
+                    return false;
+                return reachable(how, first, shift);
+            }
+
+            // a base vertex is kept positive: what GL does with a negative index plus base vertex is not worth relying on
+            static bool reachable(shift_by how, int64_t first, int64_t shift) {
+                constexpr int64_t most = std::numeric_limits<GLint>::max();
+                if (how == shift_by::first_vertex)
+                    return first + shift >= 0 && first + shift <= most;
+                return how == shift_by::base_vertex && shift >= 0 && shift <= most;
+            }
+
+            // the most whole vertices every vertex stream can be moved back by and still start inside its buffer
+            int64_t lowest_vertex() const {
+                int64_t lowest = std::numeric_limits<int64_t>::max();
+                for (uint32_t mask = pipeline_->stream_mask; mask; mask &= mask - 1) {
+                    const auto s = static_cast<uint32_t>(std::countr_zero(mask));
+                    const uint64_t stride = pipeline_->streams[s].stride;
+                    if (pipeline_->streams[s].step == vertex_step::vertex && stride)
+                        lowest = std::min(lowest, static_cast<int64_t>(vertex_[s].offset / stride));
+                }
+                return lowest == std::numeric_limits<int64_t>::max() ? 0 : lowest;
+            }
+
+            bool prepare_draw(int64_t base_vertex, int64_t base_instance, shift_by how, int64_t first, int64_t& shift) {
                 if (!in_pass_ || !pipeline_ || pipeline_->compute) {
                     dev_.report_once("a draw was recorded outside a render pass or without a graphics pipeline");
                     return false;
@@ -1589,20 +1711,30 @@ namespace conduit::gles {
                     gl_.glStencilFuncSeparate(GL_BACK, s.back.func, static_cast<GLint>(stencil_ref_), s.stencil_read);
                     stencil_dirty_ = false;
                 }
-                if (attribs_dirty_ || base_vertex != applied_base_vertex_ || base_instance != applied_base_instance_)
-                    set_arrays(base_vertex, base_instance);
+                if (!arrays_reach(base_vertex, base_instance, how, first, shift)) {
+                    // specified from as far back as the buffers allow, later draws that move forward in them reach
+                    // their vertices without specifying the arrays again
+                    int64_t anchor = base_vertex;
+                    if (how != shift_by::none) {
+                        anchor = -lowest_vertex();
+                        if (!reachable(how, first, base_vertex - anchor))
+                            anchor = base_vertex;
+                    }
+                    set_arrays(anchor, base_instance);
+                    shift = base_vertex - anchor;
+                }
                 return true;
             }
 
             void draw(const p_draw& a) {
-                if (!prepare_draw(0, a.first_instance))
+                int64_t shift = 0;
+                if (!prepare_draw(0, a.first_instance, shift_by::first_vertex, a.first_vertex, shift))
                     return;
+                const GLint first = static_cast<GLint>(a.first_vertex + shift);
                 if (a.instance_count == 1)
-                    gl_.glDrawArrays(pipeline_->topology, static_cast<GLint>(a.first_vertex),
-                                     static_cast<GLsizei>(a.vertex_count));
+                    gl_.glDrawArrays(pipeline_->topology, first, static_cast<GLsizei>(a.vertex_count));
                 else
-                    gl_.glDrawArraysInstanced(pipeline_->topology, static_cast<GLint>(a.first_vertex),
-                                              static_cast<GLsizei>(a.vertex_count),
+                    gl_.glDrawArraysInstanced(pipeline_->topology, first, static_cast<GLsizei>(a.vertex_count),
                                               static_cast<GLsizei>(a.instance_count));
             }
 
@@ -1621,17 +1753,25 @@ namespace conduit::gles {
             }
 
             void draw_indexed(const p_draw_indexed& a) {
-                if (!prepare_draw(a.vertex_offset, a.first_instance) || !bind_index_buffer())
+                int64_t shift = 0;
+                const shift_by how = dev_.features().base_vertex ? shift_by::base_vertex : shift_by::none;
+                if (!prepare_draw(a.vertex_offset, a.first_instance, how, 0, shift) || !bind_index_buffer())
                     return;
                 const bool wide = index_type_ == index_type::u32;
                 const uint64_t offset = index_offset_ + static_cast<uint64_t>(a.first_index) * (wide ? 4 : 2);
                 const void* at = gl_offset(offset);
                 const GLenum type = wide ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
-                if (a.instance_count == 1)
-                    gl_.glDrawElements(pipeline_->topology, static_cast<GLsizei>(a.index_count), type, at);
+                const auto count = static_cast<GLsizei>(a.index_count);
+                const auto instances = static_cast<GLsizei>(a.instance_count);
+                if (shift != 0 && a.instance_count == 1)
+                    gl_.glDrawElementsBaseVertex(pipeline_->topology, count, type, at, static_cast<GLint>(shift));
+                else if (shift != 0)
+                    gl_.glDrawElementsInstancedBaseVertex(pipeline_->topology, count, type, at, instances,
+                                                          static_cast<GLint>(shift));
+                else if (a.instance_count == 1)
+                    gl_.glDrawElements(pipeline_->topology, count, type, at);
                 else
-                    gl_.glDrawElementsInstanced(pipeline_->topology, static_cast<GLsizei>(a.index_count), type, at,
-                                                static_cast<GLsizei>(a.instance_count));
+                    gl_.glDrawElementsInstanced(pipeline_->topology, count, type, at, instances);
             }
 
             void draw_indirect(const p_indirect& a) {
@@ -1640,12 +1780,18 @@ namespace conduit::gles {
                     return;
                 }
                 const buffer* args = dev_.buffer_of(a.args);
-                if (!args || !args->gl || !prepare_draw(0, 0) || !bind_index_buffer())
+                int64_t shift = 0;
+                if (!args || !args->gl || !prepare_draw(0, 0, shift_by::none, 0, shift) || !bind_index_buffer())
                     return;
                 gl_.glBindBuffer(GL_DRAW_INDIRECT_BUFFER, args->gl);
                 const GLenum type = index_type_ == index_type::u32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
                 const uint32_t stride = a.stride ? a.stride : sizeof(draw_indexed_indirect_command);
-                // one draw per call: ES has no multi draw indirect
+                if (dev_.features().multi_draw_indirect) {
+                    gl_.glMultiDrawElementsIndirect(pipeline_->topology, type, gl_offset(a.offset),
+                                                    static_cast<GLsizei>(a.max_draws), static_cast<GLsizei>(stride));
+                    return;
+                }
+                // one draw per call: core ES has no multi draw indirect
                 for (uint32_t i = 0; i < a.max_draws; i++)
                     gl_.glDrawElementsIndirect(pipeline_->topology, type,
                                                gl_offset(a.offset + static_cast<uint64_t>(i) * stride));
@@ -1685,6 +1831,8 @@ namespace conduit::gles {
             std::array<uint8_t, max_push_constant_bytes> push_{};
             bool push_dirty_ = true;
             std::array<vertex_slot, max_vertex_streams> vertex_{};
+            // the vertex buffers the arrays were last specified for
+            std::array<vertex_slot, max_vertex_streams> applied_vertex_{};
             bool attribs_dirty_ = true;
             int64_t applied_base_vertex_ = 0, applied_base_instance_ = 0;
             buffer_handle index_;

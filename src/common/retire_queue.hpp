@@ -3,6 +3,7 @@
 
 #include <array>
 #include <functional>
+#include <list>
 #include <mutex>
 #include <vector>
 
@@ -16,71 +17,103 @@ namespace conduit {
     public:
         void push(const queue_serials& submitted, std::function<void()> release) {
             std::lock_guard lock(mutex_);
-            items_.push_back({submitted, std::move(release)});
+            if (items_.empty() || items_.back().serials != submitted)
+                append_batch(submitted);
+            items_.back().releases.push_back(std::move(release));
+            pending_++;
         }
 
         void defer(std::function<void()> release) {
             std::lock_guard lock(mutex_);
             open_.push_back(std::move(release));
+            pending_++;
         }
 
         void seal(const queue_serials& submitted) {
             std::lock_guard lock(mutex_);
-            for (auto& release : open_)
-                items_.push_back({submitted, std::move(release)});
-            open_.clear();
+            if (open_.empty())
+                return;
+            // Every release made during this frame has the same fence requirements. Keep those requirements
+            // once for the whole frame, and exchange buffers with a completed batch instead of copying callbacks.
+            append_batch(submitted);
+            items_.back().releases.swap(open_);
         }
 
         void collect(const queue_serials& completed) {
-            std::vector<std::function<void()>> running;
+            std::list<batch> running;
             {
                 std::lock_guard lock(mutex_);
-                if (items_.empty())
-                    return;
-                ready_.clear();
-                size_t kept = 0;
-                for (size_t i = 0; i < items_.size(); i++) {
-                    if (covered(items_[i].serials, completed)) {
-                        ready_.push_back(std::move(items_[i].release));
-                    } else {
-                        if (kept != i)
-                            items_[kept] = std::move(items_[i]);
-                        kept++;
+                // Do not stop at the first unfinished batch: push() can supply unrelated, nonmonotonic serials
+                // from different queues. A ready batch must never wait behind an unfinished one.
+                for (auto it = items_.begin(); it != items_.end();) {
+                    auto current = it++;
+                    if (covered(current->serials, completed)) {
+                        pending_ -= current->releases.size();
+                        running.splice(running.end(), items_, current);
                     }
                 }
-                items_.resize(kept);
-                if (ready_.empty())
-                    return;
-                running.swap(ready_);
             }
-            for (auto& fn : running)
-                fn();
+            invoke(running);
+            recycle(running);
         }
 
         void flush_all() {
-            std::vector<retire_queue::item> all;
+            std::list<batch> all;
             std::vector<std::function<void()>> open;
             {
                 std::lock_guard lock(mutex_);
-                all.swap(items_);
+                all.splice(all.end(), items_);
                 open.swap(open_);
+                pending_ = 0;
             }
-            for (auto& item : all)
-                item.release();
+            invoke(all);
             for (auto& release : open)
                 release();
+            open.clear();
+            recycle(all);
         }
 
         size_t pending() const {
             std::lock_guard lock(mutex_);
-            return items_.size() + open_.size();
+            return pending_;
         }
 
     private:
-        struct item {
+        struct batch {
             queue_serials serials;
-            std::function<void()> release;
+            std::vector<std::function<void()>> releases;
         };
+
+        // mutex_ is held by the caller. Recycled batches contain no callbacks, only reusable storage.
+        void append_batch(const queue_serials& serials) {
+            if (spare_.empty())
+                items_.emplace_back();
+            else
+                items_.splice(items_.end(), spare_, spare_.begin());
+            items_.back().serials = serials;
+        }
+
+        static void invoke(std::list<batch>& batches) {
+            for (auto& b : batches)
+                for (auto& release : b.releases)
+                    release();
+        }
+
+        void recycle(std::list<batch>& batches) {
+            if (batches.empty())
+                return;
+            // Both invocation and captured-resource destruction stay outside mutex_: a release may retire
+            // another resource, collect another ready batch, or destroy an object that does either. Keep every
+            // callback alive until all callbacks in this collection have run, as with the unbatched queue.
+            for (auto& b : batches)
+                b.releases.clear();
+            std::lock_guard lock(mutex_);
+            // Bound retained scratch storage even for clients that push thousands of distinct fence values.
+            constexpr size_t max_spares = 8;
+            while (!batches.empty() && spare_.size() < max_spares)
+                spare_.splice(spare_.end(), batches, batches.begin());
+            // Any excess empty batches are destroyed by the caller after this lock is released.
+        }
 
         static bool covered(const queue_serials& need, const queue_serials& done) {
             for (size_t i = 0; i < queue_count; i++)
@@ -90,7 +123,8 @@ namespace conduit {
         }
 
         mutable std::mutex mutex_;
-        std::vector<item> items_;
-        std::vector<std::function<void()>> open_, ready_;
+        std::list<batch> items_, spare_;
+        std::vector<std::function<void()>> open_;
+        size_t pending_ = 0;
     };
 }

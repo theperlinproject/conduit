@@ -91,7 +91,6 @@ namespace conduit::metal {
         g_depth24_stencil8 = device_.depth24Stencil8PixelFormatSupported;
 #endif
         fill_caps();
-        frame_fence_ = create_fence(0);
         return true;
     }
 
@@ -124,6 +123,7 @@ namespace conduit::metal {
         f.draw_indirect_first_instance = true;
         f.shader_float16 = true;
         f.unified_memory = device_.hasUnifiedMemory;
+        memoryless_targets_ = [device_ supportsFamily:MTLGPUFamilyApple1];
         f.subgroup_ops = apple3 || mac;
         f.ray_tracing = device_.supportsRaytracing;
         f.hdr_output = true;
@@ -133,6 +133,13 @@ namespace conduit::metal {
         f.async_compute = false;
         f.dedicated_copy_queue = false;
         f.timestamp_queries = false;
+        // apple gpus only sample counters where an encoder starts or ends, which is where a pass timestamp falls
+        if ([device_ supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary])
+            for (id<MTLCounterSet> set in device_.counterSets)
+                if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+                    timestamp_counters_ = set;
+                    f.timestamp_queries = true;
+                }
 #if TARGET_OS_OSX
         f.texture_compression_bc = device_.supportsBCTextureCompression;
 #else
@@ -166,6 +173,7 @@ namespace conduit::metal {
     }
 
     buffer_handle device::create_buffer(const buffer_desc& desc) {
+        const autorelease_scope pool;
         buffer b;
         b.desc = desc;
         b.name = desc.name ? desc.name : "";
@@ -189,18 +197,18 @@ namespace conduit::metal {
         if (!b.name.empty())
             b.native.label = [NSString stringWithUTF8String:b.name.c_str()];
         b.size = size;
-        if (desc.memory != memory_class::gpu_only) {
+        // metal hands out zero-filled buffers, so clearing one again would only touch every page for nothing
+        if (desc.memory != memory_class::gpu_only)
             b.contents = static_cast<uint8_t*>([b.native contents]);
-            std::memset(b.contents, 0, size);
-        }
-        stats_.buffer_bytes += size;
-        stats_.live_buffers++;
+        buffer_bytes_.fetch_add(size, std::memory_order_relaxed);
+        live_buffers_.fetch_add(1, std::memory_order_relaxed);
         const buffer_handle h = buffers_.alloc(std::move(b));
         buffers_.get(h)->desc.name = buffers_.get(h)->name.c_str();
         return h;
     }
 
     texture_handle device::create_texture(const texture_desc& desc) {
+        const autorelease_scope pool;
         const MTLPixelFormat pf = to_pixel_format(desc.format);
         if (pf == MTLPixelFormatInvalid) {
             report_error("CreateTexture: unsupported format " + std::to_string(static_cast<int>(desc.format)));
@@ -223,6 +231,12 @@ namespace conduit::metal {
         td.mipmapLevelCount = ms ? 1 : t.desc.mips;
         td.sampleCount = t.desc.samples;
         td.storageMode = MTLStorageModePrivate;
+        // a tile-based gpu keeps a transient target in tile memory only
+        t.memoryless = memoryless_targets_ && has(desc.usage, texture_usage::transient) &&
+                       !has(desc.usage, texture_usage::sampled) && !has(desc.usage, texture_usage::storage) &&
+                       !has(desc.usage, texture_usage::copy_src) && !has(desc.usage, texture_usage::copy_dst);
+        if (t.memoryless)
+            td.storageMode = MTLStorageModeMemoryless;
         MTLTextureUsage usage = MTLTextureUsageUnknown;
         if (has(desc.usage, texture_usage::sampled))
             usage |= MTLTextureUsageShaderRead;
@@ -230,7 +244,10 @@ namespace conduit::metal {
             usage |= MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
         if (has(desc.usage, texture_usage::color_target) || has(desc.usage, texture_usage::depth_target))
             usage |= MTLTextureUsageRenderTarget;
-        if (!is_depth_format(desc.format) || has_stencil(desc.format))
+        // a texture that can be reinterpreted loses lossless compression: only for a second format that was asked
+        // for, and for the stencil half of a depth-stencil texture
+        const bool other_format = desc.view_format != format::unknown && desc.view_format != desc.format;
+        if (!t.memoryless && (other_format || has_stencil(desc.format)))
             usage |= MTLTextureUsagePixelFormatView;
         td.usage = usage;
         t.native = [device_ newTextureWithDescriptor:td];
@@ -243,14 +260,16 @@ namespace conduit::metal {
         for (uint32_t m = 0; m < t.desc.mips; m++)
             bytes += static_cast<uint64_t>(row_bytes(desc.format, mip_extent(desc.width, m))) *
                      row_blocks(desc.format, mip_extent(desc.height, m)) * layer_count_of(t.desc) * depth_of(t.desc);
-        stats_.texture_bytes += bytes * t.desc.samples;
-        stats_.live_textures++;
+        t.bytes = t.memoryless ? 0 : bytes * t.desc.samples;
+        texture_bytes_.fetch_add(t.bytes, std::memory_order_relaxed);
+        live_textures_.fetch_add(1, std::memory_order_relaxed);
         const texture_handle h = textures_.alloc(std::move(t));
         textures_.get(h)->desc.name = textures_.get(h)->name.c_str();
         return h;
     }
 
     sampler_handle device::create_sampler(const sampler_desc& desc) {
+        const autorelease_scope pool;
         sampler s;
         s.desc = desc;
         MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
@@ -310,7 +329,29 @@ namespace conduit::metal {
         bind_group g;
         g.layout = desc.layout;
         g.entries.assign(desc.entries.begin(), desc.entries.end());
-        stats_.live_bind_groups++;
+        g.indexed = !desc.per_frame && g.entries.size() <= 127;
+        if (g.indexed)
+            g.index_of.fill(-1);
+        for (size_t i = 0; g.indexed && i < g.entries.size(); i++) {
+            const bind_group_entry& e = g.entries[i];
+            if (e.array_index == 0 && e.binding < g.index_of.size() && g.index_of[e.binding] < 0)
+                g.index_of[e.binding] = static_cast<int8_t>(i);
+        }
+        for (size_t i = 0; i < g.entries.size(); i++) {
+            const bind_group_entry& e = g.entries[i];
+            if (!e.texture.texture)
+                continue;
+            // a transient group is bound about once, so resolving its views up front would only add to its cost
+            if (texture* t = desc.per_frame ? nullptr : textures_.get(e.texture.texture)) {
+                if (g.views.empty())
+                    g.views.resize(g.entries.size());
+                bind_group::resolved_view& v = g.views[i];
+                v.epoch = t->epoch.load(std::memory_order_acquire);
+                v.dim = e.texture.view_dim;
+                v.view = view_of(*t, e.texture.range, e.texture.view_dim, e.texture.format, e.texture.stencil);
+            }
+        }
+        live_bind_groups_.fetch_add(1, std::memory_order_relaxed);
         return bind_groups_.alloc(std::move(g));
     }
 
@@ -324,25 +365,76 @@ namespace conduit::metal {
     }
 
     query_set_handle device::create_query_set(const query_set_desc& desc) {
+        const autorelease_scope pool;
         query q;
         q.count = desc.count;
+        if (timestamp_counters_ && desc.count) {
+            // measuring the gpu clock takes a couple of milliseconds: paid by the first query set, not by every
+            // device, most of which never time anything
+            std::call_once(timestamps_calibrated_, [this] { calibrate_timestamps(); });
+            MTLCounterSampleBufferDescriptor* d = [MTLCounterSampleBufferDescriptor new];
+            d.counterSet = timestamp_counters_;
+            d.sampleCount = desc.count;
+            d.storageMode = MTLStorageModeShared;
+            if (desc.name)
+                d.label = [NSString stringWithUTF8String:desc.name];
+            NSError* error = nil;
+            q.samples = [device_ newCounterSampleBufferWithDescriptor:d error:&error];
+            if (!q.samples)
+                report_error("CreateQuerySet: " +
+                             std::string(error ? error.localizedDescription.UTF8String : "no counter sample buffer"));
+        }
         return queries_.alloc(std::move(q));
+    }
+
+    id<MTLComputePipelineState> device::timestamp_marker() {
+        std::lock_guard lock(marker_mutex_);
+        if (!timestamp_marker_) {
+            NSError* error = nil;
+            id<MTLLibrary> lib =
+                [device_ newLibraryWithSource:@"kernel void conduit_marker(device uint* b [[buffer(0)]]) { b[0] = 1u; }"
+                                      options:nil
+                                        error:&error];
+            id<MTLFunction> fn = [lib newFunctionWithName:@"conduit_marker"];
+            if (fn)
+                timestamp_marker_ = [device_ newComputePipelineStateWithFunction:fn error:&error];
+            timestamp_scratch_ = [device_ newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+            if (!timestamp_marker_)
+                report_error("timestamp marker: " +
+                             std::string(error ? error.localizedDescription.UTF8String : "no pipeline"));
+        }
+        return timestamp_marker_;
+    }
+
+    void device::calibrate_timestamps() {
+        // both clocks come back in nanoseconds on current macs, but measure the gpu one against the cpu one in
+        // case a gpu ticks at its own rate
+        MTLTimestamp cpu0 = 0, gpu0 = 0, cpu1 = 0, gpu1 = 0;
+        [device_ sampleTimestamps:&cpu0 gpuTimestamp:&gpu0];
+        const auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(2))
+            ;
+        [device_ sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
+        if (gpu1 > gpu0 && cpu1 > cpu0)
+            timestamp_period_ = static_cast<float>(static_cast<double>(cpu1 - cpu0) / static_cast<double>(gpu1 - gpu0));
     }
 
     void device::destroy(buffer_handle h) {
         buffer b;
         if (!buffers_.free(h, &b))
             return;
-        stats_.buffer_bytes -= b.size;
-        stats_.live_buffers--;
+        buffer_bytes_.fetch_sub(b.size, std::memory_order_relaxed);
+        live_buffers_.fetch_sub(1, std::memory_order_relaxed);
     }
 
     void device::destroy(texture_handle h) {
         texture t;
         if (!textures_.free(h, &t))
             return;
-        if (!t.external)
-            stats_.live_textures--;
+        if (!t.external) {
+            texture_bytes_.fetch_sub(t.bytes, std::memory_order_relaxed);
+            live_textures_.fetch_sub(1, std::memory_order_relaxed);
+        }
     }
 
     void device::destroy(sampler_handle h) {
@@ -356,14 +448,14 @@ namespace conduit::metal {
     }
     void device::destroy(bind_group_handle h) {
         if (bind_groups_.free(h))
-            stats_.live_bind_groups--;
+            live_bind_groups_.fetch_sub(1, std::memory_order_relaxed);
     }
     void device::destroy(pipeline_layout_handle h) {
         pipeline_layouts_.free(h);
     }
     void device::destroy(pipeline_handle h) {
         if (pipelines_.free(h))
-            stats_.live_pipelines--;
+            live_pipelines_.fetch_sub(1, std::memory_order_relaxed);
     }
     void device::destroy(query_set_handle h) {
         queries_.free(h);
@@ -401,6 +493,11 @@ namespace conduit::metal {
                 pf = MTLPixelFormatX24_Stencil8;
 #endif
         }
+        if (format != conduit::format::unknown && format != t.desc.format && format != t.desc.view_format) {
+            report_error("texture '" + t.name + "' is viewed in a format it was not created with a view_format for");
+            format = conduit::format::unknown;
+            pf = to_pixel_format(t.desc.format);
+        }
         const bool whole_mips = r.base_mip == 0 && r.mip_count == (std::max)(1u, t.desc.mips);
         const bool whole_layers = r.base_layer == 0 && r.layer_count == layers;
         const bool same_type = (dim == texture_dim::tex2d && t.desc.dim == texture_dim::tex2d) || dim == t.desc.dim;
@@ -420,6 +517,7 @@ namespace conduit::metal {
         std::lock_guard lock(view_mutex_);
         if (const auto it = t.views.find(key); it != t.views.end())
             return it->second;
+        const autorelease_scope pool;
         MTLTextureType type = to_texture_type(dim, false, false);
         if (dim == texture_dim::tex2d && layers > 1)
             type = MTLTextureType2D;
@@ -454,6 +552,7 @@ namespace conduit::metal {
         std::lock_guard lock(view_mutex_);
         t->views.clear();
         t->native = texture;
+        t->epoch.fetch_add(1, std::memory_order_release);
     }
 
     void device::resize_surface_texture(texture_handle handle, uint32_t width, uint32_t height) {
@@ -560,7 +659,7 @@ namespace conduit::metal {
         if (state < 0 && !b.reported.exchange(true))
             report_error(b.error);
         if (state == 0)
-            stats_.pipelines_pending++;
+            pipelines_pending_.fetch_add(1, std::memory_order_relaxed);
         return nil;
     }
 
@@ -570,6 +669,7 @@ namespace conduit::metal {
     }
 
     pipeline_handle device::create_graphics_pipeline(const graphics_pipeline_desc& desc) {
+        const autorelease_scope pool;
         const shader* vs = shaders_.get(desc.vertex);
         const shader* fs = shaders_.get(desc.fragment);
         const pipeline_layout* layout = pipeline_layouts_.get(desc.layout);
@@ -726,11 +826,12 @@ namespace conduit::metal {
         p.bias_clamp = desc.raster.depth_bias_clamp;
         p.primitive = to_primitive(desc.topology);
         p.stream_count = desc.stream_count;
-        stats_.live_pipelines++;
+        live_pipelines_.fetch_add(1, std::memory_order_relaxed);
         return pipelines_.alloc(std::move(p));
     }
 
     pipeline_handle device::create_compute_pipeline(const compute_pipeline_desc& desc) {
+        const autorelease_scope pool;
         const shader* cs = shaders_.get(desc.compute);
         const pipeline_layout* layout = pipeline_layouts_.get(desc.layout);
         if (!cs || !layout) {
@@ -753,7 +854,7 @@ namespace conduit::metal {
             return {};
         }
         p.threads = MTLSizeMake(cs->threads[0], cs->threads[1], cs->threads[2]);
-        stats_.live_pipelines++;
+        live_pipelines_.fetch_add(1, std::memory_order_relaxed);
         return pipelines_.alloc(std::move(p));
     }
 
@@ -786,22 +887,42 @@ namespace conduit::metal {
         [after addCompletedHandler:^(id<MTLCommandBuffer>) { timeline->raise(value); }];
     }
 
+    void device::commit(id<MTLCommandBuffer> cb) {
+        const uint64_t serial = committed_.fetch_add(1, std::memory_order_relaxed) + 1;
+        std::shared_ptr<timeline> done = completed_;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer>) { done->raise(serial); }];
+        [cb commit];
+    }
+
+    device_stats device::stats() const {
+        constexpr auto relaxed = std::memory_order_relaxed;
+        device_stats s;
+        counters_.fill(s);
+        s.buffer_bytes = buffer_bytes_.load(relaxed);
+        s.texture_bytes = texture_bytes_.load(relaxed);
+        s.live_buffers = live_buffers_.load(relaxed);
+        s.live_textures = live_textures_.load(relaxed);
+        s.live_pipelines = live_pipelines_.load(relaxed);
+        s.live_bind_groups = live_bind_groups_.load(relaxed);
+        s.pipelines_pending = pipelines_pending_.load(relaxed);
+        return s;
+    }
+
     void device::begin_frame() {
         frame_++;
         const uint64_t behind = (std::max)(1u, options_.frames_in_flight);
         if (frame_ > behind)
-            wait_fence(frame_fence_, frame_ - behind, 2'000'000'000ull);
+            completed_->wait(frame_serials_[(frame_ - behind) % frame_serials_.size()], 2'000'000'000ull);
     }
 
     void device::end_frame() {
-        id<MTLCommandBuffer> cb = [queue_ commandBuffer];
-        signal_when_done(cb, frame_fence_, frame_);
-        [cb commit];
+        frame_serials_[frame_ % frame_serials_.size()] = committed_.load(std::memory_order_relaxed);
     }
 
     void device::wait_idle() {
         if (!queue_)
             return;
+        const autorelease_scope pool;
         id<MTLCommandBuffer> cb = [queue_ commandBuffer];
         [cb commit];
         [cb waitUntilCompleted];
@@ -830,13 +951,14 @@ namespace conduit::metal {
     }
 
     void device::submit(queue_type, const submit_desc& desc) {
+        const autorelease_scope pool;
         id<MTLCommandBuffer> last = nil;
         for (conduit::command_list* base : desc.lists) {
             id<MTLCommandBuffer> cb = static_cast<cmd_list*>(base)->finish();
             if (!cb)
                 continue;
             if (last)
-                [last commit];
+                commit(last);
             last = cb;
         }
         if (!last && !desc.signals.empty())
@@ -844,14 +966,16 @@ namespace conduit::metal {
         if (last) {
             for (const fence_op& op : desc.signals)
                 signal_when_done(last, op.fence, op.value);
-            [last commit];
+            commit(last);
         }
         {
             std::lock_guard lock(list_mutex_);
-            for (conduit::command_list* base : desc.lists)
+            for (conduit::command_list* base : desc.lists) {
+                counters_.add(static_cast<cmd_list*>(base)->counters());
                 free_lists_.push_back(static_cast<cmd_list*>(base));
+            }
         }
-        stats_.submits++;
+        counters_.count_submit();
     }
 
     std::unique_ptr<conduit::swapchain> device::create_swapchain(const swapchain_desc& desc) {

@@ -55,6 +55,7 @@ namespace conduit {
 
     void state_validator::on_create(texture_handle handle, const texture_desc& desc, state initial) {
         std::lock_guard lock(mutex_);
+        version_.fetch_add(1, std::memory_order_release);
         texture_info info;
         info.desc = desc;
         info.layers = layer_count(desc);
@@ -64,21 +65,25 @@ namespace conduit {
 
     void state_validator::on_create(buffer_handle handle, const buffer_desc& desc) {
         std::lock_guard lock(mutex_);
+        version_.fetch_add(1, std::memory_order_release);
         buffers_[handle.value] = {desc, state::undefined};
     }
 
     void state_validator::on_destroy(texture_handle handle) {
         std::lock_guard lock(mutex_);
+        version_.fetch_add(1, std::memory_order_release);
         textures_.erase(handle.value);
     }
 
     void state_validator::on_destroy(buffer_handle handle) {
         std::lock_guard lock(mutex_);
+        version_.fetch_add(1, std::memory_order_release);
         buffers_.erase(handle.value);
     }
 
     void state_validator::barrier(const texture_barrier& barrier) {
         std::lock_guard lock(mutex_);
+        version_.fetch_add(1, std::memory_order_release);
         auto it = textures_.find(barrier.texture.value);
         if (it == textures_.end()) {
             report("barrier on a destroyed or unknown texture");
@@ -107,6 +112,7 @@ namespace conduit {
 
     void state_validator::barrier(const buffer_barrier& barrier) {
         std::lock_guard lock(mutex_);
+        version_.fetch_add(1, std::memory_order_release);
         auto it = buffers_.find(barrier.buffer.value);
         if (it == buffers_.end()) {
             report("barrier on a destroyed or unknown buffer");
@@ -124,6 +130,11 @@ namespace conduit {
     void state_validator::expect_texture(texture_handle handle, const subresource_range& range, conduit::state want,
                                          const char* what) {
         std::lock_guard lock(mutex_);
+        expect_texture_locked(handle, range, want, what);
+    }
+
+    void state_validator::expect_texture_locked(texture_handle handle, const subresource_range& range,
+                                                conduit::state want, const char* what) {
         auto it = textures_.find(handle.value);
         if (it == textures_.end()) {
             report(std::string(what) + ": unknown texture");
@@ -149,6 +160,10 @@ namespace conduit {
 
     void state_validator::expect_buffer(buffer_handle handle, state want, const char* what) {
         std::lock_guard lock(mutex_);
+        expect_buffer_locked(handle, want, what);
+    }
+
+    void state_validator::expect_buffer_locked(buffer_handle handle, state want, const char* what) {
         auto it = buffers_.find(handle.value);
         if (it == buffers_.end()) {
             report(std::string(what) + ": unknown buffer");
@@ -164,13 +179,25 @@ namespace conduit {
                    state_name(info.state) + ", needs " + state_name(want));
     }
 
-    void state_validator::expect_all(const std::vector<bound_resource>& resources, const char* what) {
+    bool state_validator::expect_all(const std::vector<bound_resource>& resources, const char* what) {
+        if (resources.empty())
+            return true;
+        std::lock_guard lock(mutex_);
+        const size_t before = total_;
         for (const bound_resource& r : resources) {
             if (r.texture)
-                expect_texture(r.texture, r.range, r.want, what);
+                expect_texture_locked(r.texture, r.range, r.want, what);
             else if (r.buffer)
-                expect_buffer(r.buffer, r.want, what);
+                expect_buffer_locked(r.buffer, r.want, what);
         }
+        return total_ == before;
+    }
+
+    bool state_validator::expect_buffer_ok(buffer_handle handle, state want, const char* what) {
+        std::lock_guard lock(mutex_);
+        const size_t before = total_;
+        expect_buffer_locked(handle, want, what);
+        return total_ == before;
     }
 
     size_t state_validator::error_count() const {

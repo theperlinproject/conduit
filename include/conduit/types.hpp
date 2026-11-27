@@ -182,6 +182,10 @@ namespace conduit {
         depth_target = 1u << 3,
         copy_src = 1u << 4,
         copy_dst = 1u << 5,
+        // a render target whose contents never leave the pass that draws it: cleared or left undefined at the
+        // start, resolved or dropped at the end, never sampled or copied (a multisampled colour target, a depth
+        // buffer nothing reads later). tile-based gpus then give it no memory at all
+        transient = 1u << 6,
     };
     constexpr texture_usage operator|(texture_usage a, texture_usage b) {
         return static_cast<texture_usage>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
@@ -202,6 +206,10 @@ namespace conduit {
         bool cross_queue = false;
         const char* name = nullptr;
         std::array<float, 4> optimized_clear{};
+        // the one other format a binding may view this texture as (texture_binding::format), usually its srgb
+        // or linear twin. a texture that can be reinterpreted loses framebuffer compression on most gpus, so
+        // only the textures that say so here can be
+        conduit::format view_format = conduit::format::unknown;
     };
 
     struct subresource_range {

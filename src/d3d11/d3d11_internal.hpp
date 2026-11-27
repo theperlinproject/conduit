@@ -1,5 +1,6 @@
 #pragma once
 #include <conduit/device.hpp>
+#include "common/counters.hpp"
 #include "common/handle_pool.hpp"
 #include "common/shader_reflect.hpp"
 #include "common/util.hpp"
@@ -24,6 +25,7 @@
 #endif
 
 #include <array>
+#include <atomic>
 #include <deque>
 #include <map>
 #include <memory>
@@ -86,6 +88,7 @@ namespace conduit::d3d11 {
         texture_desc desc;
         std::string name;
         format_map formats;
+        uint64_t bytes = 0;
         bool external = false;
         std::map<view_key, winrt::com_ptr<ID3D11View>> views;
     };
@@ -109,6 +112,13 @@ namespace conduit::d3d11 {
     struct bind_group {
         bind_layout_handle layout;
         std::vector<bind_group_entry> entries;
+        // shader resource views of the sampled textures, made once here so binding takes no view lock; one per
+        // entry, null where the entry is not a sampled texture
+        struct texture_view {
+            winrt::com_ptr<ID3D11ShaderResourceView> srv;
+            texture_dim dim = texture_dim::tex2d;
+        };
+        std::vector<texture_view> views;
     };
 
     struct pipeline_layout {
@@ -139,6 +149,9 @@ namespace conduit::d3d11 {
         D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         std::array<UINT, max_vertex_streams> strides{};
         uint32_t stream_count = 0;
+        uint32_t per_vertex = 0;
+        // the vertex shader reads SV_VertexID, which a moved start vertex would change
+        bool vertex_id = false;
         std::array<std::vector<stage_slot>, 3> stages;
     };
 
@@ -160,8 +173,9 @@ namespace conduit::d3d11 {
 
         bool init();
         queue_type queue() const override { return queue_; }
-        void begin();
+        void begin(queue_type queue);
         ID3D11CommandList* finish();
+        ID3D11CommandList* finished() const { return finished_.get(); }
         void release_finished() { finished_ = nullptr; }
 
         void barrier(std::span<const texture_barrier> textures, std::span<const buffer_barrier> buffers) override;
@@ -201,16 +215,26 @@ namespace conduit::d3d11 {
         void begin_debug_label(const char* name, uint32_t rgba) override;
         void end_debug_label() override;
         void* native_handle() override { return ctx_.get(); }
+        const list_counters& counters() const { return counters_; }
         void invalidate_bound_state() override {
             dirty_sets_ = 0xF;
             pipeline_dirty_ = true;
             vertex_dirty_ = 0xFF;
             index_dirty_ = true;
+            reset_bound();
         }
 
     private:
-        bool prepare_draw();
+        bool prepare_draw(int64_t max_shift);
+        bool bind_vertex_streams(const pipeline& p, int64_t max_shift);
         bool bind_sets(const pipeline& p);
+        void reset_bound();
+        void bind_constant(uint32_t stage, uint32_t slot, ID3D11Buffer* cb, bool offset_call, UINT first,
+                           UINT constants);
+        void bind_srv(uint32_t stage, uint32_t slot, ID3D11ShaderResourceView* srv);
+        void bind_sampler(uint32_t stage, uint32_t slot, ID3D11SamplerState* state);
+        void flush_graphics_binds();
+        void apply_pipeline(const pipeline& p);
         void clear_bindings();
         void unbind_targets();
         void copy_to_constant(buffer& b, uint64_t offset, uint64_t size);
@@ -221,6 +245,7 @@ namespace conduit::d3d11 {
         winrt::com_ptr<ID3D11DeviceContext1> ctx1_;
         winrt::com_ptr<ID3D11CommandList> finished_;
         bool recorded_ = false;
+        list_counters counters_;
 
         pipeline_handle pipeline_;
         struct bound_set {
@@ -230,6 +255,29 @@ namespace conduit::d3d11 {
         };
         std::array<bound_set, max_bind_groups> sets_{};
         uint32_t dirty_sets_ = 0;
+        // sets rebound with the same group and only new dynamic offsets rebind the uniform ranges the last full
+        // bind resolved instead of resolving the group again
+        uint32_t offsets_dirty_ = 0;
+        static constexpr uint8_t no_dynamic = 0xFF;
+        struct uniform_range {
+            uint8_t stage = 0, slot = 0, dynamic = no_dynamic;
+            // an earlier range of the same set reading the same bytes, whose mirror this one binds instead of
+            // copying them again
+            uint8_t same = no_dynamic;
+            uint32_t binding = 0;
+            buffer_handle buffer;
+            uint64_t base = 0, size = 0;
+            ID3D11Buffer* mirror = nullptr;
+        };
+        struct resolved_set {
+            pipeline_handle pipeline;
+            bind_group_handle group;
+            bool valid = false;
+            uint32_t count = 0;
+            std::array<uniform_range, 8> constants{};
+        };
+        std::array<resolved_set, max_bind_groups> resolved_{};
+        bool bind_uniform(uniform_range& u, const uniform_range* same, const bound_set& set);
         bool pipeline_dirty_ = true;
         struct vertex_slot {
             buffer_handle buffer;
@@ -237,6 +285,36 @@ namespace conduit::d3d11 {
         };
         std::array<vertex_slot, max_vertex_streams> vertex_{};
         uint32_t vertex_dirty_ = 0;
+        // every per-vertex stream of the pipeline sits this many of its strides past the offset bound in the
+        // context, so draws add it to their start vertex instead of rebinding the streams
+        uint32_t vertex_shift_ = 0;
+        // what the deferred context already holds, so identical binds never reach the runtime. identity only:
+        // the context keeps its own reference to whatever is bound, so an address cannot be reused under it
+        static constexpr uint32_t cached_constants = 14, cached_srvs = 32, cached_samplers = 16;
+        struct stage_bound {
+            std::array<ID3D11Buffer*, cached_constants> constants{};
+            std::array<UINT, cached_constants> first{}, count{};
+            std::array<ID3D11ShaderResourceView*, cached_srvs> srvs{};
+            std::array<ID3D11SamplerState*, cached_samplers> samplers{};
+            // graphics slots changed since the last draw, sent as one call per stage over this range
+            uint32_t srv_begin = cached_srvs, srv_end = 0;
+            uint32_t sampler_begin = cached_samplers, sampler_end = 0;
+        };
+        std::array<stage_bound, 3> bound_{};
+        struct state_bound {
+            ID3D11InputLayout* input_layout = nullptr;
+            D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+            ID3D11VertexShader* vs = nullptr;
+            ID3D11PixelShader* ps = nullptr;
+            ID3D11ComputeShader* cs = nullptr;
+            ID3D11RasterizerState* raster = nullptr;
+            ID3D11BlendState* blend = nullptr;
+            ID3D11DepthStencilState* depth_stencil = nullptr;
+            UINT stencil_ref = 0;
+            bool fresh = true;
+            std::array<ID3D11Buffer*, max_vertex_streams> vertex{};
+            std::array<UINT, max_vertex_streams> stride{}, offset{};
+        } state_bound_;
         buffer_handle index_buffer_;
         index_type index_type_ = index_type::u32;
         uint64_t index_offset_ = 0;
@@ -326,7 +404,7 @@ namespace conduit::d3d11 {
         void wait_idle() override;
 
         memory_budget query_memory_budget() override;
-        device_stats stats() const override { return stats_; }
+        device_stats stats() const override;
         float timestamp_period_ns() const override { return 1.0f; }
 
         ID3D11Device* dev() const { return device_.get(); }
@@ -334,7 +412,6 @@ namespace conduit::d3d11 {
         ID3D11DeviceContext* imm() const { return immediate_.get(); }
         instance_state& inst() const { return *inst_; }
         const device_options& options() const { return options_; }
-        device_stats& mutable_stats() { return stats_; }
         bool constant_offsetting() const { return constant_offsetting_; }
         void report_error(const std::string& message);
         std::unique_lock<std::mutex> lock_context() { return std::unique_lock<std::mutex>(ctx_mutex_); }
@@ -349,6 +426,7 @@ namespace conduit::d3d11 {
         texture_handle wrap_backbuffer(ID3D11Texture2D* texture, const texture_desc& desc);
         void set_backbuffer(texture_handle handle, ID3D11Texture2D* texture);
         void release_backbuffer(texture_handle handle);
+        winrt::com_ptr<ID3D11Texture2D> take_staging(const D3D11_TEXTURE2D_DESC& desc);
 
     private:
         handle_pool<buffer_tag, buffer> buffers_;
@@ -377,7 +455,9 @@ namespace conduit::d3d11 {
         bool adopted_ = false;
         device_options options_;
         device_caps caps_;
-        device_stats stats_;
+        device_counters counters_;
+        std::atomic<int64_t> buffer_bytes_{0}, texture_bytes_{0};
+        std::atomic<int32_t> live_buffers_{0}, live_textures_{0}, live_pipelines_{0}, live_groups_{0};
         bool constant_offsetting_ = false;
         uint64_t frame_ = 0;
         fence_handle frame_fence_;
@@ -390,6 +470,8 @@ namespace conduit::d3d11 {
         std::vector<std::unique_ptr<cmd_list>> lists_;
         std::vector<cmd_list*> free_lists_;
         std::vector<winrt::com_ptr<ID3D11Query>> free_queries_;
+        // readback staging textures whose copy was read, kept for the next readback of the same size (view_mutex_)
+        std::vector<winrt::com_ptr<ID3D11Texture2D>> staging_;
         std::unordered_map<std::string, winrt::com_ptr<ID3DBlob>> blob_cache_;
         std::mutex error_mutex_;
         std::vector<uint8_t> zeros_;

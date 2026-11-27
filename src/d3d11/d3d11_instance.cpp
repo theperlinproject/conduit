@@ -244,18 +244,25 @@ namespace conduit::d3d11 {
 
                 const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
                 D3D_FEATURE_LEVEL got{};
+                winrt::com_ptr<ID3D11Device> probe;
                 HRESULT hr = state_->lib.create_device(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                                                        D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, D3D11_SDK_VERSION,
-                                                       nullptr, &got, nullptr);
+                                                       probe.put(), &got, nullptr);
                 if (FAILED(hr))
                     hr = state_->lib.create_device(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                                                    D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels + 1, 1, D3D11_SDK_VERSION,
-                                                   nullptr, &got, nullptr);
+                                                   probe.put(), &got, nullptr);
                 if (FAILED(hr)) {
                     a.usable = false;
                     a.unusable_reason = "no Direct3D 11 feature level 11_0";
                 } else {
                     a.api_version = got;
+                    // the memory architecture says integrated or not; dedicated memory alone does not, since apus
+                    // report a carve-out of 512MB or more as dedicated. older runtimes keep the guess above
+                    D3D11_FEATURE_DATA_D3D11_OPTIONS2 options{};
+                    if (!software && probe &&
+                        SUCCEEDED(probe->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS2, &options, sizeof(options))))
+                        a.type = options.UnifiedMemoryArchitecture ? adapter_type::integrated : adapter_type::discrete;
                     if (!state_->lib.compile) {
                         a.usable = false;
                         a.unusable_reason = "d3dcompiler_47.dll is missing";

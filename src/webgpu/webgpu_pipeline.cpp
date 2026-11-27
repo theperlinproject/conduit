@@ -86,6 +86,9 @@ namespace conduit::webgpu {
             streams[i].attributes = attributes[i].data();
         }
         p.stream_count = desc.stream_count;
+        if (desc.stream_count == 1 && desc.streams[0].step == vertex_step::vertex && desc.streams[0].stride &&
+            vs->source.find("vertex_index") == std::string::npos)
+            p.shift_stride = desc.streams[0].stride;
         p.set_count = set_count;
 
         WGPURenderPipelineDescriptor rd{};
@@ -152,7 +155,7 @@ namespace conduit::webgpu {
         p.render = owned<WGPURenderPipeline>(wgpuDeviceCreateRenderPipeline(device_.get(), &rd));
         if (!p.render)
             return {};
-        stats_.live_pipelines++;
+        live_pipelines_++;
         return pipelines_.alloc(std::move(p));
     }
 
@@ -195,7 +198,7 @@ namespace conduit::webgpu {
         p.comp = owned<WGPUComputePipeline>(wgpuDeviceCreateComputePipeline(device_.get(), &cd));
         if (!p.comp)
             return {};
-        stats_.live_pipelines++;
+        live_pipelines_++;
         return pipelines_.alloc(std::move(p));
     }
 }

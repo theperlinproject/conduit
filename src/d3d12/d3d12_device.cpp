@@ -47,6 +47,29 @@ namespace conduit::d3d12 {
             return d;
         }
 
+        // waits on the calling thread's own event, so waits on different threads neither share a lock nor steal
+        // each other's signals; the fence is read again after every wake because an auto-reset event can still
+        // hold the signal of an earlier wait that timed out
+        bool wait_value(ID3D12Fence* fence, uint64_t value, DWORD timeout_ms) {
+            thread_local winrt::handle event{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
+            const ULONGLONG start = GetTickCount64();
+            while (fence->GetCompletedValue() < value) {
+                DWORD left = INFINITE;
+                if (timeout_ms != INFINITE) {
+                    const ULONGLONG spent = GetTickCount64() - start;
+                    if (spent >= timeout_ms)
+                        return false;
+                    left = static_cast<DWORD>(timeout_ms - spent);
+                }
+                // without a usable event, a null one makes the call itself block until the value is reached
+                if (!event || FAILED(fence->SetEventOnCompletion(value, event.get())))
+                    return SUCCEEDED(fence->SetEventOnCompletion(value, nullptr));
+                if (WaitForSingleObject(event.get(), left) == WAIT_FAILED)
+                    return false;
+            }
+            return true;
+        }
+
         D3D12_UNORDERED_ACCESS_VIEW_DESC buffer_uav(uint64_t offset, uint64_t size, uint32_t stride) {
             D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
             d.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -86,6 +109,9 @@ namespace conduit::d3d12 {
         rd.SampleDesc.Count = 1;
         rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         memory_class memory = desc.memory;
+        // gpu_mappable goes to video memory the cpu can write (resizable bar) where there is such a heap and the
+        // gpu does not already read system memory at full speed; otherwise it is a plain upload buffer
+        const bool gpu_upload = memory == memory_class::gpu_mappable && gpu_upload_heap_;
         if (memory == memory_class::gpu_mappable)
             memory = memory_class::upload;
         // upload and readback heaps cannot hold unordered-access resources: storage there is read-only (an srv)
@@ -108,9 +134,25 @@ namespace conduit::d3d12 {
             ad.HeapType = D3D12_HEAP_TYPE_DEFAULT;
             break;
         }
+        HRESULT hr = E_FAIL;
+        if (gpu_upload) {
+            // a buffer in common is promoted to whatever read state each use needs, which stands in for the
+            // fixed generic read of an upload heap; barriers skip it just the same
+            D3D12MA::ALLOCATION_DESC gd{};
+            gd.HeapType = D3D12_HEAP_TYPE_GPU_UPLOAD;
+            hr = allocator_->CreateResource(&gd, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, rec.alloc.put(),
+                                            winrt::guid_of<ID3D12Resource>(), rec.resource.put_void());
+            if (SUCCEEDED(hr))
+                initial = D3D12_RESOURCE_STATE_COMMON;
+        }
+        if (FAILED(hr)) {
+            rec.alloc = nullptr;
+            rec.resource = nullptr;
+            hr = allocator_->CreateResource(&ad, &rd, initial, nullptr, rec.alloc.put(),
+                                            winrt::guid_of<ID3D12Resource>(), rec.resource.put_void());
+        }
         rec.state = initial;
-        if (FAILED(allocator_->CreateResource(&ad, &rd, initial, nullptr, rec.alloc.put(),
-                                              winrt::guid_of<ID3D12Resource>(), rec.resource.put_void()))) {
+        if (FAILED(hr)) {
             report_error("CreateBuffer '" + rec.name + "' failed");
             return {};
         }
@@ -321,14 +363,15 @@ namespace conduit::d3d12 {
         device_->CreateSampler(&sd, dst);
     }
 
-    int device::acquire_sampler_table(const std::vector<uint32_t>& key, const std::vector<sampler_desc>& descs) {
+    int device::acquire_sampler_table(std::span<const uint32_t> key, std::span<const sampler_desc> descs,
+                                      uint32_t& offset) {
         std::lock_guard lock(sampler_mutex_);
         for (size_t i = 0; i < sampler_tables_.size(); i++)
-            if (sampler_tables_[i].refs > 0 && sampler_tables_[i].key == key) {
+            if (sampler_tables_[i].refs > 0 && std::ranges::equal(sampler_tables_[i].key, key)) {
                 sampler_tables_[i].refs++;
+                offset = sampler_tables_[i].offset;
                 return static_cast<int>(i);
             }
-        uint32_t offset = 0;
         if (!sampler_heap_.alloc(static_cast<uint32_t>(descs.size()), offset)) {
             report_error("sampler descriptor heap exhausted");
             return -1;
@@ -339,7 +382,7 @@ namespace conduit::d3d12 {
         table.offset = offset;
         table.count = static_cast<uint32_t>(descs.size());
         table.refs = 1;
-        table.key = key;
+        table.key.assign(key.begin(), key.end());
         for (size_t i = 0; i < sampler_tables_.size(); i++)
             if (sampler_tables_[i].refs == 0) {
                 sampler_tables_[i] = std::move(table);
@@ -366,7 +409,7 @@ namespace conduit::d3d12 {
             return {};
         }
         shader_rec rec;
-        rec.code.assign(desc.code.begin(), desc.code.end());
+        rec.code = std::make_shared<const std::vector<uint8_t>>(desc.code.begin(), desc.code.end());
         rec.stage = desc.stage;
         return shaders_.alloc(std::move(rec));
     }
@@ -374,6 +417,7 @@ namespace conduit::d3d12 {
     bind_layout_handle device::create_bind_layout(const bind_layout_desc& desc) {
         bind_layout_rec rec;
         rec.entries.assign(desc.entries.begin(), desc.entries.end());
+        rec.lookup.assign(rec.entries);
         for (const bind_layout_entry& e : rec.entries) {
             const uint32_t count = (std::max)(1u, e.count);
             switch (e.type) {
@@ -411,24 +455,42 @@ namespace conduit::d3d12 {
         rec.per_frame = desc.per_frame;
         rec.dynamic_count = layout->dynamic_count;
         rec.table_count = layout->table_count;
-        if (rec.table_count && !resource_heap_.alloc(rec.table_count, rec.table_offset)) {
-            report_error("CreateBindGroup: descriptor heap exhausted");
-            return {};
+        const uint32_t slot = slot_;
+        if (rec.table_count) {
+            if (desc.per_frame && ring_alloc(slot, rec.table_count, rec.table_offset)) {
+                rec.ring = true;
+            } else if (!resource_heap_.alloc(rec.table_count, rec.table_offset)) {
+                report_error("CreateBindGroup: descriptor heap exhausted");
+                return {};
+            }
         }
 
-        std::vector<uint32_t> sampler_key(layout->sampler_count, 0);
-        std::vector<sampler_desc> sampler_descs(layout->sampler_count);
+        // the sampler key and descriptions live on the stack unless the layout has an unusual number of samplers
+        constexpr uint32_t inline_samplers = 16;
+        std::array<uint32_t, inline_samplers> key_inline{};
+        std::array<sampler_desc, inline_samplers> descs_inline{};
+        std::vector<uint32_t> key_heap;
+        std::vector<sampler_desc> descs_heap;
+        std::span<uint32_t> sampler_key(key_inline.data(), layout->sampler_count);
+        std::span<sampler_desc> sampler_descs(descs_inline.data(), layout->sampler_count);
+        if (layout->sampler_count > inline_samplers) {
+            key_heap.resize(layout->sampler_count);
+            descs_heap.resize(layout->sampler_count);
+            sampler_key = key_heap;
+            sampler_descs = descs_heap;
+        }
 
         for (const bind_group_entry& e : desc.entries) {
-            size_t index = SIZE_MAX;
-            for (size_t i = 0; i < layout->entries.size(); i++)
-                if (layout->entries[i].binding == e.binding)
-                    index = i;
-            if (index == SIZE_MAX) {
+            const size_t index = layout->lookup.find(e.binding);
+            if (index == binding_lookup::missing) {
                 report_error("CreateBindGroup: binding " + std::to_string(e.binding) + " is not in the layout");
                 continue;
             }
             const bind_layout_entry& le = layout->entries[index];
+            if (e.array_index >= (std::max)(1u, le.count)) {
+                report_error("CreateBindGroup: binding " + std::to_string(e.binding) + " array index out of range");
+                continue;
+            }
             const uint32_t slot_index = layout->table_offset[index] + e.array_index;
 
             switch (le.type) {
@@ -568,30 +630,36 @@ namespace conduit::d3d12 {
             }
         }
 
-        if (layout->sampler_count) {
-            rec.sampler_table = acquire_sampler_table(sampler_key, sampler_descs);
-            if (rec.sampler_table >= 0) {
-                std::lock_guard lock(sampler_mutex_);
-                rec.sampler_offset = sampler_tables_[static_cast<size_t>(rec.sampler_table)].offset;
-            }
-        }
+        if (layout->sampler_count)
+            rec.sampler_table = acquire_sampler_table(sampler_key, sampler_descs, rec.sampler_offset);
         live_groups_++;
         bind_group_handle h = bind_groups_.alloc(std::move(rec));
         if (desc.per_frame) {
             std::lock_guard lock(frame_group_mutex_);
-            frame_groups_[slot_].groups.push_back(h);
+            frame_groups_[slot].groups.push_back(h);
         }
         return h;
     }
 
+    bool device::ring_alloc(uint32_t slot, uint32_t count, uint32_t& offset) {
+        const uint32_t at = ring_used_[slot].fetch_add(count, std::memory_order_relaxed);
+        if (at > ring_per_slot_ || count > ring_per_slot_ - at)
+            return false;
+        offset = ring_base_ + slot * ring_per_slot_ + at;
+        return true;
+    }
+
     pipeline_layout_handle device::create_pipeline_layout(const pipeline_layout_desc& desc) {
         pipeline_layout_rec rec;
-        rec.sets = desc.sets;
-        rec.table_param.fill(-1);
-        rec.sampler_param.fill(-1);
-        for (auto& row : rec.dynamic_param)
+        root_params& rp = rec.params;
+        for (uint32_t s = 0; s < max_bind_groups; s++)
+            if (desc.sets[s])
+                rp.set_mask |= 1u << s;
+        rp.table.fill(-1);
+        rp.samplers.fill(-1);
+        for (auto& row : rp.dynamic)
             row.fill(-1);
-        rec.push_bytes = desc.push_constant_bytes;
+        rp.push_bytes = desc.push_constant_bytes;
 
         std::array<std::vector<D3D12_DESCRIPTOR_RANGE1>, max_bind_groups> table_ranges;
         std::array<std::vector<D3D12_DESCRIPTOR_RANGE1>, max_bind_groups> sampler_ranges;
@@ -637,7 +705,7 @@ namespace conduit::d3d12 {
             p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
             p.Constants = {0, 15, desc.push_constant_bytes / 4};
             p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-            rec.push_param = static_cast<int>(params.size());
+            rp.push = static_cast<int>(params.size());
             params.push_back(p);
         }
         for (uint32_t s = 0; s < max_bind_groups; s++) {
@@ -649,7 +717,7 @@ namespace conduit::d3d12 {
                 p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
                 p.DescriptorTable = {static_cast<UINT>(table_ranges[s].size()), table_ranges[s].data()};
                 p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-                rec.table_param[s] = static_cast<int>(params.size());
+                rp.table[s] = static_cast<int>(params.size());
                 params.push_back(p);
             }
             if (!sampler_ranges[s].empty()) {
@@ -657,7 +725,7 @@ namespace conduit::d3d12 {
                 p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
                 p.DescriptorTable = {static_cast<UINT>(sampler_ranges[s].size()), sampler_ranges[s].data()};
                 p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-                rec.sampler_param[s] = static_cast<int>(params.size());
+                rp.samplers[s] = static_cast<int>(params.size());
                 params.push_back(p);
             }
             for (size_t k = 0; k < l->dynamic_bindings.size(); k++) {
@@ -665,7 +733,7 @@ namespace conduit::d3d12 {
                 p.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
                 p.Descriptor = {l->dynamic_bindings[k], s, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
                 p.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-                rec.dynamic_param[s][k] = static_cast<int>(params.size());
+                rp.dynamic[s][k] = static_cast<int>(params.size());
                 params.push_back(p);
             }
         }
@@ -695,10 +763,11 @@ namespace conduit::d3d12 {
 
     struct device::pipeline_job {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
-        std::vector<uint8_t> vs, ps;
+        std::shared_ptr<const std::vector<uint8_t>> vs, ps;
         std::array<D3D12_INPUT_ELEMENT_DESC, max_vertex_attributes> elements{};
         winrt::com_ptr<ID3D12RootSignature> root;
         std::wstring library_name;
+        uint64_t key = 0;
         std::string name;
         uint32_t color_count = 0, attribute_count = 0;
         std::shared_ptr<pipeline_build> build;
@@ -712,14 +781,14 @@ namespace conduit::d3d12 {
     void device::run_pipeline_job(pipeline_job& job) {
         // the desc points into the job, which lives on the heap until this returns
         job.pd.pRootSignature = job.root.get();
-        job.pd.VS = {job.vs.data(), job.vs.size()};
-        if (!job.ps.empty())
-            job.pd.PS = {job.ps.data(), job.ps.size()};
+        job.pd.VS = {job.vs->data(), job.vs->size()};
+        if (job.ps)
+            job.pd.PS = {job.ps->data(), job.ps->size()};
         job.pd.InputLayout = {job.elements.data(), job.attribute_count};
         winrt::com_ptr<ID3D12PipelineState> pso;
         HRESULT hr = E_FAIL;
         if (pipeline_library_) {
-            std::lock_guard lock(library_mutex_);
+            std::lock_guard lock(load_mutex(job.key));
             hr = pipeline_library_->LoadGraphicsPipeline(job.library_name.c_str(), &job.pd,
                                                          winrt::guid_of<ID3D12PipelineState>(), pso.put_void());
         }
@@ -797,9 +866,9 @@ namespace conduit::d3d12 {
         compile_idle_.wait(lock, [&] { return compile_queue_.empty() && compile_running_ == 0; });
     }
 
-    winrt::com_ptr<ID3D12PipelineState> device::ready_pipeline(const pipeline_rec& p) {
+    ID3D12PipelineState* device::ready_pipeline(const pipeline_rec& p) {
         if (!p.build)
-            return p.pso;
+            return p.pso.get();
         pipeline_build& b = *p.build;
         int state = b.state.load(std::memory_order_acquire);
         if (state == 0 && !b.waited.exchange(true)) {
@@ -807,7 +876,7 @@ namespace conduit::d3d12 {
             state = b.state.load(std::memory_order_acquire);
         }
         if (state == 1)
-            return b.pso;
+            return b.pso.get();
         if (state < 0 && !b.reported.exchange(true))
             report_error(b.error);
         return nullptr;
@@ -824,9 +893,9 @@ namespace conduit::d3d12 {
 
         D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = layout->root_signature.get();
-        pd.VS = {vs->code.data(), vs->code.size()};
+        pd.VS = {vs->code->data(), vs->code->size()};
         if (fs)
-            pd.PS = {fs->code.data(), fs->code.size()};
+            pd.PS = {fs->code->data(), fs->code->size()};
 
         pd.BlendState.AlphaToCoverageEnable = desc.blend.alpha_to_coverage;
         pd.BlendState.IndependentBlendEnable = TRUE;
@@ -892,9 +961,9 @@ namespace conduit::d3d12 {
             pd.DSVFormat = map_format(desc.depth_format).dsv;
         pd.SampleDesc = {(std::max)(1u, desc.samples), 0};
 
-        uint64_t key = fnv(vs->code.data(), vs->code.size());
+        uint64_t key = fnv(vs->code->data(), vs->code->size());
         if (fs)
-            key = fnv(fs->code.data(), fs->code.size(), key);
+            key = fnv(fs->code->data(), fs->code->size(), key);
         key = fnv(&pd.BlendState, sizeof(pd.BlendState), key);
         key = fnv(&pd.RasterizerState, sizeof(pd.RasterizerState), key);
         key = fnv(&pd.DepthStencilState, sizeof(pd.DepthStencilState), key);
@@ -921,7 +990,7 @@ namespace conduit::d3d12 {
         rec.color_count = desc.color_count;
         rec.color_formats = desc.color_formats;
         rec.depth_format = desc.depth_format;
-        rec.push_bytes = layout->push_bytes;
+        rec.params = layout->params;
         if (!compile_threads_.empty()) {
             auto job = std::make_shared<pipeline_job>();
             job->pd = pd;
@@ -934,6 +1003,7 @@ namespace conduit::d3d12 {
             job->color_count = desc.color_count;
             job->root = layout->root_signature;
             job->library_name = name;
+            job->key = key;
             job->name = desc.name ? desc.name : "";
             job->build = std::make_shared<pipeline_build>();
             rec.build = job->build;
@@ -948,7 +1018,7 @@ namespace conduit::d3d12 {
         }
         HRESULT hr = E_FAIL;
         if (pipeline_library_) {
-            std::lock_guard lock(library_mutex_);
+            std::lock_guard lock(load_mutex(key));
             hr = pipeline_library_->LoadGraphicsPipeline(name.c_str(), &pd, winrt::guid_of<ID3D12PipelineState>(),
                                                          rec.pso.put_void());
         }
@@ -980,7 +1050,7 @@ namespace conduit::d3d12 {
         rec.color_count = desc.color_count;
         rec.color_formats = desc.color_formats;
         rec.depth_format = desc.depth_format;
-        rec.push_bytes = layout->push_bytes;
+        rec.params = layout->params;
         live_pipelines_++;
         return pipelines_.alloc(std::move(rec));
     }
@@ -994,15 +1064,15 @@ namespace conduit::d3d12 {
         }
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature = layout->root_signature.get();
-        pd.CS = {cs->code.data(), cs->code.size()};
-        uint64_t key = fnv(cs->code.data(), cs->code.size());
+        pd.CS = {cs->code->data(), cs->code->size()};
+        uint64_t key = fnv(cs->code->data(), cs->code->size());
         key = fnv(&layout->hash, sizeof(layout->hash), key);
         const std::wstring name = hash_name("c", key);
 
         pipeline_rec rec;
         HRESULT hr = E_FAIL;
         if (pipeline_library_) {
-            std::lock_guard lock(library_mutex_);
+            std::lock_guard lock(load_mutex(key));
             hr = pipeline_library_->LoadComputePipeline(name.c_str(), &pd, winrt::guid_of<ID3D12PipelineState>(),
                                                         rec.pso.put_void());
         }
@@ -1022,7 +1092,7 @@ namespace conduit::d3d12 {
         rec.compute = true;
         rec.root_signature = layout->root_signature;
         rec.layout_handle = desc.layout;
-        rec.push_bytes = layout->push_bytes;
+        rec.params = layout->params;
         live_pipelines_++;
         return pipelines_.alloc(std::move(rec));
     }
@@ -1066,7 +1136,11 @@ namespace conduit::d3d12 {
             report_error("CreateWorkGraph: the state object has no program or work graph properties");
             return {};
         }
+#ifdef __MINGW32__
+        props->GetProgramIdentifier(&rec.program, program.c_str());
+#else
         rec.program = props->GetProgramIdentifier(program.c_str());
+#endif
         const UINT index = wprops->GetWorkGraphIndex(program.c_str());
         D3D12_WORK_GRAPH_MEMORY_REQUIREMENTS mem{};
         wprops->GetWorkGraphMemoryRequirements(index, &mem);
@@ -1099,7 +1173,7 @@ namespace conduit::d3d12 {
         rec.compute = true;
         rec.root_signature = layout->root_signature;
         rec.layout_handle = desc.layout;
-        rec.push_bytes = layout->push_bytes;
+        rec.params = layout->params;
         live_pipelines_++;
         return pipelines_.alloc(std::move(rec));
     }
@@ -1183,9 +1257,10 @@ namespace conduit::d3d12 {
         bind_group_rec rec;
         bind_groups_.free(h, &rec);
         live_groups_--;
-        retire([this, rec] {
-            resource_heap_.free(rec.table_offset, rec.table_count);
-            release_sampler_table(rec.sampler_table);
+        // only what the release needs: small enough for std::function to keep inline on msvc and libc++
+        retire([this, offset = rec.table_offset, count = rec.table_count, samplers = rec.sampler_table] {
+            resource_heap_.free(offset, count);
+            release_sampler_table(samplers);
         });
     }
 
@@ -1261,15 +1336,10 @@ namespace conduit::d3d12 {
         fence_rec* f = fences_.get(h);
         if (!f)
             return false;
-        if (f->fence->GetCompletedValue() >= value)
-            return true;
-        std::lock_guard lock(wait_mutex_);
-        if (FAILED(f->fence->SetEventOnCompletion(value, wait_event_.get())))
-            return false;
         const DWORD ms = timeout_ns == ~0ull
                              ? INFINITE
                              : static_cast<DWORD>(std::min<uint64_t>(timeout_ns / 1'000'000ull, 0xFFFFFFFEull));
-        return WaitForSingleObject(wait_event_.get(), ms) == WAIT_OBJECT_0;
+        return wait_value(f->fence.get(), value, ms);
     }
 
     void device::signal_fence(fence_handle h, uint64_t value) {
@@ -1290,12 +1360,22 @@ namespace conduit::d3d12 {
     }
 
     thread_pools& device::pools_for_this_thread() {
+        // entries are never removed while the device lives, so a thread remembers its own for the next acquire;
+        // the id (not the address) tells devices apart, since a new device can reuse a freed one's address
+        struct cached {
+            uint64_t device = 0;
+            thread_pools* pools = nullptr;
+        };
+        thread_local cached last;
+        if (last.device == id_)
+            return *last.pools;
         std::lock_guard lock(pools_mutex_);
         auto& entry = thread_pools_[std::this_thread::get_id()];
         if (!entry) {
             entry = std::make_unique<thread_pools>();
             entry->slots.resize(options_.frames_in_flight);
         }
+        last = {id_, entry.get()};
         return *entry;
     }
 
@@ -1329,7 +1409,8 @@ namespace conduit::d3d12 {
                                                    ? conduit::queue_type::graphics
                                                    : requested;
         queue_info& q = queues_[static_cast<size_t>(queue_type)];
-        std::vector<ID3D12CommandList*> native;
+        thread_local std::vector<ID3D12CommandList*> native;
+        native.clear();
         native.reserve(desc.lists.size());
         for (command_list* l : desc.lists) {
             auto* list = static_cast<cmd_list*>(l);
@@ -1379,10 +1460,20 @@ namespace conduit::d3d12 {
             bind_group_rec rec;
             if (bind_groups_.free(g, &rec)) {
                 live_groups_--;
-                resource_heap_.free(rec.table_offset, rec.table_count);
+                if (!rec.ring)
+                    resource_heap_.free(rec.table_offset, rec.table_count);
                 release_sampler_table(rec.sampler_table);
             }
         }
+        groups.clear();
+        {
+            std::lock_guard lock(frame_group_mutex_);
+            // Reuse the handle vector next time this slot is filled. A recording thread that appended while
+            // retirement ran keeps its entries; only an empty destination takes the spare capacity.
+            if (frame_groups_[s].groups.empty())
+                groups.swap(frame_groups_[s].groups);
+        }
+        ring_used_[s].store(0, std::memory_order_relaxed);
     }
 
     void device::begin_frame() {
@@ -1399,16 +1490,11 @@ namespace conduit::d3d12 {
         for (size_t i = 0; i < queue_count; i++) {
             if (!need[i] || !queues_[i].fence)
                 continue;
-            if (queues_[i].fence->GetCompletedValue() >= need[i])
-                continue;
-            std::lock_guard lock(wait_mutex_);
-            queues_[i].fence->SetEventOnCompletion(need[i], wait_event_.get());
             // never reuse a slot whose frame is still running: wait it out unless the device is gone
-            DWORD w = WaitForSingleObject(wait_event_.get(), 10'000);
-            while (w == WAIT_TIMEOUT && device_ && device_->GetDeviceRemovedReason() == S_OK &&
-                   queues_[i].fence->GetCompletedValue() < need[i])
-                w = WaitForSingleObject(wait_event_.get(), 10'000);
-            if (w != WAIT_OBJECT_0 && queues_[i].fence->GetCompletedValue() < need[i])
+            bool done = wait_value(queues_[i].fence.get(), need[i], 10'000);
+            while (!done && device_ && device_->GetDeviceRemovedReason() == S_OK)
+                done = wait_value(queues_[i].fence.get(), need[i], 10'000);
+            if (!done)
                 report_error("frame wait did not complete");
         }
         reset_slot(slot_);
@@ -1427,12 +1513,7 @@ namespace conduit::d3d12 {
         for (size_t i = 0; i < queue_count; i++) {
             if (!queues_[i].fence)
                 continue;
-            const uint64_t target = queues_[i].serial.load();
-            if (queues_[i].fence->GetCompletedValue() >= target)
-                continue;
-            std::lock_guard lock(wait_mutex_);
-            queues_[i].fence->SetEventOnCompletion(target, wait_event_.get());
-            WaitForSingleObject(wait_event_.get(), INFINITE);
+            wait_value(queues_[i].fence.get(), queues_[i].serial.load(), INFINITE);
         }
         if (!in_frame_) {
             queue_serials now;

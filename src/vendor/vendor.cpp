@@ -1,3 +1,4 @@
+#include <conduit/render_profile.hpp>
 #include <conduit/vendor.hpp>
 
 #include <algorithm>
@@ -11,6 +12,12 @@ namespace conduit::vendor {
 
     std::unique_ptr<session> session::begin(conduit::api api, const session_request& request, vendor_hooks& hooks,
                                             std::string* log) {
+        // the interposer wraps every dxgi and vulkan entry point once loaded: not worth it for nothing
+        if (!request.upscaler && !request.frame_generation && !request.low_latency) {
+            if (log)
+                *log += "no vendor feature requested; ";
+            return nullptr;
+        }
 #if defined(CONDUIT_HAS_STREAMLINE) && CONDUIT_HAS_STREAMLINE
         return make_streamline_session(api, request, hooks, log);
 #else
@@ -39,6 +46,27 @@ namespace conduit::vendor {
             return 1.0f / 3.0f;
         }
         return 1.0f;
+    }
+
+    quality quality_for(float render_scale) {
+        for (const vendor::quality q : {quality::ultra_performance, quality::performance, quality::balanced,
+                                        quality::quality, quality::ultra_quality})
+            if (scale_of(q) + 0.005f >= render_scale)
+                return q;
+        return quality::native;
+    }
+
+    session_request request_for(const render_profile& profile) {
+        session_request r;
+        const bool nvidia =
+            !profile.fallbacks.empty() && profile.fallbacks.front().adapter.vendor_id == vendor_id::nvidia;
+        const bool served = nvidia && (profile.api == api::d3d12 || profile.api == api::vulkan);
+        r.upscaler = served && std::find(profile.upscalers.begin(), profile.upscalers.end(), conduit::upscaler::dlss) !=
+                                   profile.upscalers.end();
+        r.frame_generation = served && profile.frame_generation;
+        // reflex costs nothing when idle and is what makes generated frames bearable
+        r.low_latency = served && (r.frame_generation || profile.workload == workload::low_latency || r.upscaler);
+        return r;
     }
 
     const char* quality_name(vendor::quality quality) {

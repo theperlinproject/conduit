@@ -50,29 +50,29 @@ namespace conduit::vk {
                 vmaDestroyImage(allocator_, r.image, r.alloc);
         });
         samplers_.for_each([&](sampler_handle, sampler_rec& r) { fn_.vkDestroySampler(device_, r.sampler, nullptr); });
-        shaders_.for_each([&](shader_handle, shader_rec& r) { fn_.vkDestroyShaderModule(device_, r.module, nullptr); });
+        shaders_.for_each([&](shader_handle, shader_rec& r) { r.module.reset(); });
         bind_layouts_.for_each([&](bind_layout_handle, bind_layout_rec& r) {
             fn_.vkDestroyDescriptorSetLayout(device_, r.layout, nullptr);
         });
-        pipeline_layouts_.for_each([&](pipeline_layout_handle, pipeline_layout_rec& r) {
-            fn_.vkDestroyPipelineLayout(device_, r.layout, nullptr);
-        });
         pipelines_.for_each([&](pipeline_handle, pipeline_rec& r) {
             fn_.vkDestroyPipeline(device_, r.build ? r.build->pipeline : r.pipeline, nullptr);
+            r.layout_owner.reset();
         });
+        pipeline_layouts_.for_each([&](pipeline_layout_handle, pipeline_layout_rec& r) { r.owner.reset(); });
         queries_.for_each([&](query_set_handle, query_rec& r) { fn_.vkDestroyQueryPool(device_, r.pool, nullptr); });
         fences_.for_each([&](fence_handle, fence_rec& r) { release_timeline(r.timeline); });
 
         for (VkDescriptorPool p : persistent_pools_)
             fn_.vkDestroyDescriptorPool(device_, p, nullptr);
-        for (auto& f : frame_descriptors_)
-            for (VkDescriptorPool p : f.pools)
-                fn_.vkDestroyDescriptorPool(device_, p, nullptr);
-        for (auto& [id, tp] : thread_pools_)
+        for (auto& [id, tp] : thread_pools_) {
             for (auto& slot_pools : tp->slots)
                 for (auto& q : slot_pools)
-                    if (q.pool)
-                        fn_.vkDestroyCommandPool(device_, q.pool, nullptr);
+                    for (auto& list : q.lists)
+                        fn_.vkDestroyCommandPool(device_, list->pool(), nullptr);
+            for (auto& f : tp->descriptors)
+                for (VkDescriptorPool p : f.pools)
+                    fn_.vkDestroyDescriptorPool(device_, p, nullptr);
+        }
         for (auto& q : queues_)
             release_timeline(q.timeline);
         for (auto& [key, pass] : render_passes_)
@@ -80,6 +80,9 @@ namespace conduit::vk {
         for (auto& list : slot_framebuffers_)
             for (VkFramebuffer f : list)
                 fn_.vkDestroyFramebuffer(device_, f, nullptr);
+        for (const cached_framebuffer& c : framebuffer_cache_)
+            fn_.vkDestroyFramebuffer(device_, c.framebuffer, nullptr);
+        framebuffer_cache_.clear();
         for (VkFence f : all_fences_)
             fn_.vkDestroyFence(device_, f, nullptr);
         if (empty_set_layout_)
@@ -484,7 +487,6 @@ namespace conduit::vk {
         VkDescriptorSetLayoutCreateInfo empty{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         fn_.vkCreateDescriptorSetLayout(device_, &empty, nullptr, &empty_set_layout_);
 
-        frame_descriptors_.resize(options_.frames_in_flight);
         slot_framebuffers_.resize(options_.frames_in_flight);
         slot_serials_.assign(options_.frames_in_flight, queue_serials{});
 
@@ -542,11 +544,22 @@ namespace conduit::vk {
         caps_.limits.max_buffer_size = 1ull << 30;
 
         VkPhysicalDeviceSubgroupProperties sub{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        // the range a shader may really run at (intel 8 to 32, amd 32 or 64), not only the default size
+        VkPhysicalDeviceSubgroupSizeControlProperties sizes{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+        const bool size_control =
+            phys_.props.apiVersion >= VK_API_VERSION_1_3 || phys_.has(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+        if (size_control)
+            sub.pNext = &sizes;
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sub};
         vkGetPhysicalDeviceProperties2(physical_, &p2);
         caps_.features.subgroup_ops = (sub.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) &&
                                       (sub.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT);
         caps_.limits.min_subgroup_size = caps_.limits.max_subgroup_size = sub.subgroupSize;
+        if (size_control && sizes.minSubgroupSize && sizes.maxSubgroupSize >= sizes.minSubgroupSize) {
+            caps_.limits.min_subgroup_size = sizes.minSubgroupSize;
+            caps_.limits.max_subgroup_size = sizes.maxSubgroupSize;
+        }
 
         for (uint32_t i = 0; i < mem_props_.memoryTypeCount; i++) {
             const auto flags = mem_props_.memoryTypes[i].propertyFlags;
@@ -797,7 +810,9 @@ namespace conduit::vk {
         ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (desc.dim == texture_dim::cube)
             ii.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-        if (!get_format_info(desc.format).depth)
+        // a mutable image gives up framebuffer compression on most gpus: only where a second format was asked for
+        if (desc.view_format != format::unknown && desc.view_format != desc.format &&
+            !get_format_info(desc.format).depth)
             ii.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
         VkImageUsageFlags usage = 0;
         if (has(desc.usage, texture_usage::sampled))
@@ -812,6 +827,12 @@ namespace conduit::vk {
             usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         if (has(desc.usage, texture_usage::copy_dst))
             usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        // a target nothing reads outside its pass: a tile-based gpu can leave it without memory
+        const bool transient = has(desc.usage, texture_usage::transient) &&
+                               !(usage & ~static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                                                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT));
+        if (transient)
+            usage |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
         ii.usage = usage;
         rec.usage = usage;
         rec.create_flags = ii.flags;
@@ -837,12 +858,17 @@ namespace conduit::vk {
         ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
         if (usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))
             ai.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+        // lazily allocated where the device has such a heap (mobile), ordinary memory elsewhere
+        if (transient)
+            ai.preferredFlags = VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT;
         const VkResult r = vmaCreateImage(allocator_, &ii, &ai, &rec.image, &rec.alloc, nullptr);
         if (r != VK_SUCCESS) {
             report_error("CreateTexture '" + rec.name + "' failed (" + std::to_string(r) + ")");
             return {};
         }
         name_object(VK_OBJECT_TYPE_IMAGE, reinterpret_cast<uint64_t>(rec.image), desc.name);
+        if (usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT))
+            rec.default_view = view(rec, {}, desc.dim, format::unknown, false);
 
         uint64_t bytes = 0;
         for (uint32_t m = 0; m < rec.desc.mips; m++)
@@ -883,6 +909,12 @@ namespace conduit::vk {
             return;
         if (use_validator_)
             validator_.on_destroy(h);
+        if (!dynamic_rendering_) {
+            std::vector<VkImageView> views;
+            for (auto& [key, view] : rec.views)
+                views.push_back(view);
+            forget_framebuffers(views);
+        }
         for (auto& [key, view] : rec.views)
             fn_.vkDestroyImageView(device_, view, nullptr);
     }
@@ -918,7 +950,17 @@ namespace conduit::vk {
 
     VkImageView device::view(texture_rec& tex, const subresource_range& range, texture_dim dim, conduit::format format,
                              bool stencil) {
+        if (tex.default_view && dim == tex.desc.dim && !stencil &&
+            (format == conduit::format::unknown || format == tex.desc.format)) {
+            const subresource_range r = resolve_range(range, tex.desc);
+            if (r.base_mip == 0 && r.mip_count == tex.desc.mips && r.base_layer == 0 && r.layer_count == tex.layers)
+                return tex.default_view;
+        }
         VkFormat vk_format = format == conduit::format::unknown ? tex.format : format_to_vk(format);
+        if (vk_format != tex.format && !(tex.create_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) {
+            report_error("texture '" + tex.name + "' is viewed in a format it was not created with a view_format for");
+            vk_format = tex.format;
+        }
         VkImageAspectFlags aspect = tex.aspect;
         if (tex.aspect & VK_IMAGE_ASPECT_DEPTH_BIT)
             aspect = stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -979,11 +1021,16 @@ namespace conduit::vk {
         shader_rec rec;
         rec.stage = desc.stage;
         rec.entry = desc.entry ? desc.entry : "main";
-        if (fn_.vkCreateShaderModule(device_, &si, nullptr, &rec.module) != VK_SUCCESS) {
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (fn_.vkCreateShaderModule(device_, &si, nullptr, &module) != VK_SUCCESS) {
             report_error("vkCreateShaderModule failed");
             return {};
         }
-        name_object(VK_OBJECT_TYPE_SHADER_MODULE, reinterpret_cast<uint64_t>(rec.module), desc.name);
+        name_object(VK_OBJECT_TYPE_SHADER_MODULE, reinterpret_cast<uint64_t>(module), desc.name);
+        rec.module = shared_vk<VkShaderModule>(new VkShaderModule(module), [this](const VkShaderModule* m) {
+            fn_.vkDestroyShaderModule(device_, *m, nullptr);
+            delete m;
+        });
         return shaders_.alloc(std::move(rec));
     }
 
@@ -1047,43 +1094,62 @@ namespace conduit::vk {
         return pool;
     }
 
-    VkDescriptorSet device::allocate_set(VkDescriptorSetLayout layout, bool per_frame, VkDescriptorPool& pool_out) {
-        std::lock_guard lock(descriptor_mutex_);
+    VkDescriptorSet device::allocate_set(VkDescriptorSetLayout layout, thread_pools::frame_descriptors* frame,
+                                         VkDescriptorPool& pool_out) {
         VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         ai.descriptorSetCount = 1;
         ai.pSetLayouts = &layout;
         VkDescriptorSet set = VK_NULL_HANDLE;
 
-        if (per_frame) {
-            frame_descriptors& fd = frame_descriptors_[slot_];
+        const auto full = [](VkResult r) { return r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL; };
+        if (frame) {
+            thread_pools::frame_descriptors& fd = *frame;
             while (true) {
-                if (fd.used >= fd.pools.size())
-                    fd.pools.push_back(new_descriptor_pool(false));
+                // a set that does not fit an empty pool never will
+                const bool fresh = fd.used >= fd.pools.size();
+                if (fresh) {
+                    const VkDescriptorPool pool = new_descriptor_pool(false);
+                    if (!pool)
+                        return VK_NULL_HANDLE;
+                    fd.pools.push_back(pool);
+                }
                 ai.descriptorPool = fd.pools[fd.used];
                 const VkResult r = fn_.vkAllocateDescriptorSets(device_, &ai, &set);
                 if (r == VK_SUCCESS) {
                     pool_out = ai.descriptorPool;
                     return set;
                 }
-                if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL)
+                if (fresh || !full(r))
                     return VK_NULL_HANDLE;
                 fd.used++;
             }
         }
 
-        for (int attempt = 0; attempt < 2; attempt++) {
-            if (persistent_pools_.empty() || attempt == 1)
-                persistent_pools_.push_back(new_descriptor_pool(true));
-            ai.descriptorPool = persistent_pools_.back();
+        // a freed set goes back to its own pool: look through the others before making another, or pools would
+        // pile up under create and destroy churn with most of their sets free
+        std::lock_guard lock(descriptor_mutex_);
+        for (size_t tried = 0; tried < persistent_pools_.size(); tried++) {
+            const size_t i = (persistent_current_ + tried) % persistent_pools_.size();
+            ai.descriptorPool = persistent_pools_[i];
             const VkResult r = fn_.vkAllocateDescriptorSets(device_, &ai, &set);
             if (r == VK_SUCCESS) {
+                persistent_current_ = i;
                 pool_out = ai.descriptorPool;
                 return set;
             }
-            if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL)
-                break;
+            if (!full(r))
+                return VK_NULL_HANDLE;
         }
-        return VK_NULL_HANDLE;
+        const VkDescriptorPool pool = new_descriptor_pool(true);
+        if (!pool)
+            return VK_NULL_HANDLE;
+        persistent_pools_.push_back(pool);
+        persistent_current_ = persistent_pools_.size() - 1;
+        ai.descriptorPool = pool;
+        if (fn_.vkAllocateDescriptorSets(device_, &ai, &set) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        pool_out = pool;
+        return set;
     }
 
     bind_group_handle device::create_bind_group(const bind_group_desc& desc) {
@@ -1096,24 +1162,44 @@ namespace conduit::vk {
         rec.layout = desc.layout;
         rec.per_frame = desc.per_frame;
         rec.dynamic_count = layout->dynamic_count;
-        rec.set = allocate_set(layout->layout, desc.per_frame, rec.pool);
+        thread_pools::frame_descriptors* frame = desc.per_frame ? &pools_for_this_thread().descriptors[slot_] : nullptr;
+        rec.set = allocate_set(layout->layout, frame, rec.pool);
         if (!rec.set) {
             report_error("CreateBindGroup: descriptor allocation failed");
             return {};
         }
 
-        std::vector<VkWriteDescriptorSet> writes;
-        std::vector<VkDescriptorBufferInfo> buffer_infos;
-        std::vector<VkDescriptorImageInfo> image_infos;
-        writes.reserve(desc.entries.size());
-        buffer_infos.reserve(desc.entries.size());
-        image_infos.reserve(desc.entries.size());
+        // on the stack for the usual few entries, per thread beyond that, so making a group allocates nothing; the
+        // writes point into the info arrays
+        constexpr size_t inline_entries = 16;
+        VkWriteDescriptorSet inline_writes[inline_entries];
+        VkDescriptorBufferInfo inline_buffers[inline_entries];
+        VkDescriptorImageInfo inline_images[inline_entries];
+        VkWriteDescriptorSet* writes = inline_writes;
+        VkDescriptorBufferInfo* buffer_infos = inline_buffers;
+        VkDescriptorImageInfo* image_infos = inline_images;
+        if (desc.entries.size() > inline_entries) {
+            thread_local std::vector<VkWriteDescriptorSet> heap_writes;
+            thread_local std::vector<VkDescriptorBufferInfo> heap_buffers;
+            thread_local std::vector<VkDescriptorImageInfo> heap_images;
+            heap_writes.resize(desc.entries.size());
+            heap_buffers.resize(desc.entries.size());
+            heap_images.resize(desc.entries.size());
+            writes = heap_writes.data();
+            buffer_infos = heap_buffers.data();
+            image_infos = heap_images.data();
+        }
+        uint32_t write_count = 0, buffer_count = 0, image_count = 0;
 
-        for (const bind_group_entry& e : desc.entries) {
+        for (size_t i = 0; i < desc.entries.size(); i++) {
+            const bind_group_entry& e = desc.entries[i];
+            // entries usually come in layout order
             const bind_layout_entry* le = nullptr;
-            for (const bind_layout_entry& cand : layout->entries)
-                if (cand.binding == e.binding)
-                    le = &cand;
+            if (i < layout->entries.size() && layout->entries[i].binding == e.binding)
+                le = &layout->entries[i];
+            for (size_t j = 0; !le && j < layout->entries.size(); j++)
+                if (layout->entries[j].binding == e.binding)
+                    le = &layout->entries[j];
             if (!le) {
                 report_error("CreateBindGroup: binding " + std::to_string(e.binding) + " is not in the layout");
                 continue;
@@ -1141,8 +1227,9 @@ namespace conduit::vk {
                                                                           : state::uniform_buffer;
                     rec.bound.push_back(br);
                 }
-                buffer_infos.push_back({b->buffer, e.buffer.offset, e.buffer.size ? e.buffer.size : VK_WHOLE_SIZE});
-                w.pBufferInfo = &buffer_infos.back();
+                buffer_infos[buffer_count] = {b->buffer, e.buffer.offset,
+                                              e.buffer.size ? e.buffer.size : VK_WHOLE_SIZE};
+                w.pBufferInfo = &buffer_infos[buffer_count++];
                 w.descriptorType = le->type == binding_type::uniform_buffer ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
                                    : le->type == binding_type::uniform_buffer_dynamic
                                        ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
@@ -1168,11 +1255,11 @@ namespace conduit::vk {
                 VkImageView image_view = view(*t, e.texture.range, dim, e.texture.format, e.texture.stencil);
                 const bool depth = (t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
                 const bool storage = le->type == binding_type::storage_texture_rw;
-                image_infos.push_back({VK_NULL_HANDLE, image_view,
-                                       storage ? VK_IMAGE_LAYOUT_GENERAL
-                                               : (depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                                        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)});
-                w.pImageInfo = &image_infos.back();
+                image_infos[image_count] = {VK_NULL_HANDLE, image_view,
+                                            storage ? VK_IMAGE_LAYOUT_GENERAL
+                                                    : (depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                             : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)};
+                w.pImageInfo = &image_infos[image_count++];
                 w.descriptorType = storage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
                 break;
             }
@@ -1182,22 +1269,20 @@ namespace conduit::vk {
                     report_error("CreateBindGroup: binding " + std::to_string(e.binding) + " has no sampler");
                     continue;
                 }
-                image_infos.push_back({s->sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
-                w.pImageInfo = &image_infos.back();
+                image_infos[image_count] = {s->sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+                w.pImageInfo = &image_infos[image_count++];
                 w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
                 break;
             }
             }
-            writes.push_back(w);
+            writes[write_count++] = w;
         }
-        fn_.vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        fn_.vkUpdateDescriptorSets(device_, write_count, writes, 0, nullptr);
         live_groups_++;
 
         bind_group_handle h = bind_groups_.alloc(std::move(rec));
-        if (desc.per_frame) {
-            std::lock_guard lock(descriptor_mutex_);
-            frame_descriptors_[slot_].groups.push_back(h);
-        }
+        if (frame)
+            frame->groups.push_back(h);
         return h;
     }
 
@@ -1230,6 +1315,10 @@ namespace conduit::vk {
             return {};
         }
         name_object(VK_OBJECT_TYPE_PIPELINE_LAYOUT, reinterpret_cast<uint64_t>(rec.layout), desc.name);
+        rec.owner = shared_vk<VkPipelineLayout>(new VkPipelineLayout(rec.layout), [this](const VkPipelineLayout* l) {
+            fn_.vkDestroyPipelineLayout(device_, *l, nullptr);
+            delete l;
+        });
         return pipeline_layouts_.alloc(rec);
     }
 
@@ -1253,6 +1342,8 @@ namespace conduit::vk {
         VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
         VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         std::shared_ptr<pipeline_build> build;
+        std::array<shared_vk<VkShaderModule>, 3> modules;
+        shared_vk<VkPipelineLayout> layout;
     };
 
     bool pipeline_build::wait_for(uint64_t timeout_ns) {
@@ -1288,21 +1379,10 @@ namespace conduit::vk {
                     return;
                 job = std::move(compile_queue_.front());
                 compile_queue_.pop_front();
-                compile_running_++;
             }
             run_pipeline_job(*job);
             pipelines_pending_--;
-            {
-                std::lock_guard lock(compile_mutex_);
-                compile_running_--;
-            }
-            compile_idle_.notify_all();
         }
-    }
-
-    void device::drain_pipeline_jobs() {
-        std::unique_lock lock(compile_mutex_);
-        compile_idle_.wait(lock, [&] { return compile_queue_.empty() && compile_running_ == 0; });
     }
 
     VkPipeline device::ready_pipeline(const pipeline_rec& p) {
@@ -1343,7 +1423,7 @@ namespace conduit::vk {
                                  nullptr,
                                  0,
                                  VK_SHADER_STAGE_VERTEX_BIT,
-                                 vs->module,
+                                 *vs->module,
                                  job->vs_entry.c_str(),
                                  nullptr};
         if (gs)
@@ -1351,7 +1431,7 @@ namespace conduit::vk {
                                      nullptr,
                                      0,
                                      VK_SHADER_STAGE_GEOMETRY_BIT,
-                                     gs->module,
+                                     *gs->module,
                                      job->gs_entry.c_str(),
                                      nullptr};
         if (fs)
@@ -1359,7 +1439,7 @@ namespace conduit::vk {
                                      nullptr,
                                      0,
                                      VK_SHADER_STAGE_FRAGMENT_BIT,
-                                     fs->module,
+                                     *fs->module,
                                      job->fs_entry.c_str(),
                                      nullptr};
 
@@ -1509,11 +1589,14 @@ namespace conduit::vk {
         pi.pColorBlendState = &cb;
         pi.pDynamicState = &dyn;
         pi.layout = layout->layout;
+        job->modules = {vs->module, gs ? gs->module : nullptr, fs ? fs->module : nullptr};
+        job->layout = layout->owner;
 
         pipeline_rec rec;
         rec.bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
         rec.layout_handle = desc.layout;
         rec.layout = layout->layout;
+        rec.layout_owner = layout->owner;
         rec.push_stages = layout->push_stages;
         rec.push_bytes = layout->push_bytes;
         rec.color_count = desc.color_count;
@@ -1553,7 +1636,7 @@ namespace conduit::vk {
                     nullptr,
                     0,
                     VK_SHADER_STAGE_COMPUTE_BIT,
-                    cs->module,
+                    *cs->module,
                     cs->entry.c_str(),
                     nullptr};
         pi.layout = layout->layout;
@@ -1567,6 +1650,7 @@ namespace conduit::vk {
         rec.compute = true;
         rec.layout_handle = desc.layout;
         rec.layout = layout->layout;
+        rec.layout_owner = layout->owner;
         rec.push_stages = layout->push_stages;
         rec.push_bytes = layout->push_bytes;
         live_pipelines_++;
@@ -1607,6 +1691,12 @@ namespace conduit::vk {
         if (use_validator_)
             validator_.on_destroy(h);
         retire([this, rec = std::move(rec)] {
+            if (!dynamic_rendering_) {
+                std::vector<VkImageView> views;
+                for (auto& [key, view] : rec.views)
+                    views.push_back(view);
+                forget_framebuffers(views);
+            }
             for (auto& [key, view] : rec.views)
                 fn_.vkDestroyImageView(device_, view, nullptr);
             if (!rec.external)
@@ -1620,9 +1710,7 @@ namespace conduit::vk {
         shader_rec rec;
         if (!shaders_.free(h, &rec))
             return;
-        if (!compile_threads_.empty())
-            drain_pipeline_jobs();
-        retire([this, m = rec.module] { fn_.vkDestroyShaderModule(device_, m, nullptr); });
+        retire([m = std::move(rec.module)] {});
     }
 
     void device::destroy(bind_layout_handle h) {
@@ -1649,10 +1737,7 @@ namespace conduit::vk {
         pipeline_layout_rec rec;
         if (!pipeline_layouts_.free(h, &rec))
             return;
-        // a pipeline still compiling may reference the layout
-        if (!compile_threads_.empty())
-            drain_pipeline_jobs();
-        retire([this, l = rec.layout] { fn_.vkDestroyPipelineLayout(device_, l, nullptr); });
+        retire([l = std::move(rec.owner)] {});
     }
 
     void device::destroy(pipeline_handle h) {
@@ -1660,7 +1745,7 @@ namespace conduit::vk {
         if (!pipelines_.free(h, &rec))
             return;
         live_pipelines_--;
-        retire([this, p = rec.pipeline, build = rec.build] {
+        retire([this, p = rec.pipeline, build = rec.build, layout = std::move(rec.layout_owner)] {
             if (build) {
                 build->wait_for(~0ull >> 2);
                 fn_.vkDestroyPipeline(device_, build->pipeline, nullptr);
@@ -1740,12 +1825,20 @@ namespace conduit::vk {
     }
 
     thread_pools& device::pools_for_this_thread() {
+        // every acquire used to take the lock and hash the thread id; a thread keeps its answer per device
+        thread_local uint64_t cached_device = 0;
+        thread_local thread_pools* cached_pools = nullptr;
+        if (cached_device == instance_id_ && cached_pools)
+            return *cached_pools;
         std::lock_guard lock(pools_mutex_);
         auto& entry = thread_pools_[std::this_thread::get_id()];
         if (!entry) {
             entry = std::make_unique<thread_pools>();
             entry->slots.resize(options_.frames_in_flight);
+            entry->descriptors.resize(options_.frames_in_flight);
         }
+        cached_device = instance_id_;
+        cached_pools = entry.get();
         return *entry;
     }
 
@@ -1753,26 +1846,26 @@ namespace conduit::vk {
         thread_pools& tp = pools_for_this_thread();
         const uint32_t s = slot_;
         auto& per = tp.slots[s][static_cast<size_t>(queue)];
-        if (!per.pool) {
+        if (per.used == per.lists.size()) {
             VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
             pi.queueFamilyIndex = queues_[static_cast<size_t>(queue)].family;
             pi.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-            if (fn_.vkCreateCommandPool(device_, &pi, nullptr, &per.pool) != VK_SUCCESS) {
+            VkCommandPool pool = VK_NULL_HANDLE;
+            if (fn_.vkCreateCommandPool(device_, &pi, nullptr, &pool) != VK_SUCCESS) {
                 report_error("vkCreateCommandPool failed");
                 return nullptr;
             }
-        }
-        if (per.used == per.lists.size()) {
             VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-            ai.commandPool = per.pool;
+            ai.commandPool = pool;
             ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
             ai.commandBufferCount = 1;
             VkCommandBuffer cmd = VK_NULL_HANDLE;
             if (fn_.vkAllocateCommandBuffers(device_, &ai, &cmd) != VK_SUCCESS) {
+                fn_.vkDestroyCommandPool(device_, pool, nullptr);
                 report_error("vkAllocateCommandBuffers failed");
                 return nullptr;
             }
-            per.lists.push_back(std::make_unique<cmd_list>(*this, queue, cmd));
+            per.lists.push_back(std::make_unique<cmd_list>(*this, queue, pool, cmd));
         }
         cmd_list* list = per.lists[per.used++].get();
         list->begin();
@@ -2220,9 +2313,33 @@ namespace conduit::vk {
         return pass;
     }
 
-    // framebuffers live for the frame slot that recorded them
+    void device::forget_framebuffers(const std::vector<VkImageView>& views) {
+        if (views.empty())
+            return;
+        std::lock_guard lock(framebuffer_mutex_);
+        std::erase_if(framebuffer_cache_, [&](const cached_framebuffer& c) {
+            for (uint32_t i = 0; i < c.count; i++)
+                if (std::find(views.begin(), views.end(), c.views[i]) != views.end()) {
+                    fn_.vkDestroyFramebuffer(device_, c.framebuffer, nullptr);
+                    return true;
+                }
+            return false;
+        });
+    }
+
+    // kept across frames by attachments; one pushed out of the cache lives on until its frame slot comes round
     VkFramebuffer device::make_framebuffer(VkRenderPass pass, const VkImageView* views, uint32_t count, uint32_t width,
                                            uint32_t height) {
+        constexpr size_t kKept = 64;
+        {
+            std::lock_guard lock(framebuffer_mutex_);
+            for (cached_framebuffer& c : framebuffer_cache_)
+                if (c.pass == pass && c.count == count && c.width == width && c.height == height &&
+                    std::equal(views, views + count, c.views.begin())) {
+                    c.used = frame_;
+                    return c.framebuffer;
+                }
+        }
         VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
         fi.renderPass = pass;
         fi.attachmentCount = count;
@@ -2236,7 +2353,26 @@ namespace conduit::vk {
             return VK_NULL_HANDLE;
         }
         std::lock_guard lock(framebuffer_mutex_);
-        slot_framebuffers_[slot_].push_back(fb);
+        if (count > max_color_targets + 1) {
+            slot_framebuffers_[slot_].push_back(fb);
+            return fb;
+        }
+        if (framebuffer_cache_.size() >= kKept) {
+            auto oldest = std::min_element(
+                framebuffer_cache_.begin(), framebuffer_cache_.end(),
+                [](const cached_framebuffer& a, const cached_framebuffer& b) { return a.used < b.used; });
+            slot_framebuffers_[slot_].push_back(oldest->framebuffer);
+            framebuffer_cache_.erase(oldest);
+        }
+        cached_framebuffer c;
+        c.pass = pass;
+        std::copy_n(views, count, c.views.begin());
+        c.count = count;
+        c.width = width;
+        c.height = height;
+        c.framebuffer = fb;
+        c.used = frame_;
+        framebuffer_cache_.push_back(c);
         return fb;
     }
 
@@ -2247,12 +2383,22 @@ namespace conduit::vk {
     void device::reset_slot(uint32_t s) {
         {
             std::lock_guard lock(pools_mutex_);
-            for (auto& [id, tp] : thread_pools_)
+            for (auto& [id, tp] : thread_pools_) {
                 for (auto& per : tp->slots[s]) {
-                    if (per.pool)
-                        fn_.vkResetCommandPool(device_, per.pool, 0);
+                    for (size_t i = 0; i < per.used; i++)
+                        fn_.vkResetCommandPool(device_, per.lists[i]->pool(), 0);
                     per.used = 0;
                 }
+                // pools past the one in use were not touched since their last reset
+                thread_pools::frame_descriptors& fd = tp->descriptors[s];
+                for (size_t i = 0; i < fd.pools.size() && i <= fd.used; i++)
+                    fn_.vkResetDescriptorPool(device_, fd.pools[i], 0);
+                fd.used = 0;
+                for (bind_group_handle g : fd.groups)
+                    if (bind_groups_.free(g))
+                        live_groups_--;
+                fd.groups.clear();
+            }
         }
         {
             std::lock_guard lock(framebuffer_mutex_);
@@ -2260,16 +2406,6 @@ namespace conduit::vk {
                 fn_.vkDestroyFramebuffer(device_, f, nullptr);
             slot_framebuffers_[s].clear();
         }
-        std::lock_guard lock(descriptor_mutex_);
-        frame_descriptors& fd = frame_descriptors_[s];
-        for (VkDescriptorPool p : fd.pools)
-            fn_.vkResetDescriptorPool(device_, p, 0);
-        fd.used = 0;
-        for (bind_group_handle g : fd.groups) {
-            if (bind_groups_.free(g))
-                live_groups_--;
-        }
-        fd.groups.clear();
     }
 
     void device::begin_frame() {

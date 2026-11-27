@@ -1,6 +1,7 @@
 #include "d3d11/d3d11_internal.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 
 namespace conduit::d3d11 {
@@ -24,7 +25,8 @@ namespace conduit::d3d11 {
         return true;
     }
 
-    void cmd_list::begin() {
+    void cmd_list::begin(queue_type queue) {
+        queue_ = queue;
         finished_ = nullptr;
         recorded_ = false;
         in_pass_ = false;
@@ -40,7 +42,11 @@ namespace conduit::d3d11 {
         pass_width_ = pass_height_ = 0;
         bound_srvs_ = {};
         bound_uavs_ = 0;
+        offsets_dirty_ = 0;
+        resolved_ = {};
+        reset_bound();
         resolves_.clear();
+        counters_ = {};
         for (auto& stage_mirrors : upload_mirrors_)
             for (upload_mirror& m : stage_mirrors)
                 m.valid = false;
@@ -57,13 +63,13 @@ namespace conduit::d3d11 {
     }
 
     void cmd_list::barrier(std::span<const texture_barrier> textures, std::span<const buffer_barrier> buffers) {
-        device_.mutable_stats().barriers += textures.size() + buffers.size();
+        counters_.barriers += textures.size() + buffers.size();
     }
     void cmd_list::uav_barrier(buffer_handle) {
-        device_.mutable_stats().barriers++;
+        counters_.barriers++;
     }
     void cmd_list::uav_barrier(texture_handle) {
-        device_.mutable_stats().barriers++;
+        counters_.barriers++;
     }
 
     void cmd_list::copy_to_constant(buffer& b, uint64_t offset, uint64_t size) {
@@ -139,7 +145,8 @@ namespace conduit::d3d11 {
             sd.Usage = D3D11_USAGE_STAGING;
             sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             pending_readback pending;
-            if (FAILED(device_.dev()->CreateTexture2D(&sd, nullptr, pending.staging.put()))) {
+            pending.staging = device_.take_staging(sd);
+            if (!pending.staging) {
                 device_.report_error("CopyTextureToBuffer: could not create the staging texture");
                 continue;
             }
@@ -185,6 +192,15 @@ namespace conduit::d3d11 {
             size = b->gpu_size - (std::min)(offset, b->gpu_size);
         if (!size)
             return;
+        // a raw view clears on the gpu, so nothing is built on the cpu or copied into the command list
+        if (has(b->desc.usage, buffer_usage::storage) && b->desc.memory != memory_class::readback && !b->structured &&
+            (offset & 3) == 0 && (size & 3) == 0)
+            if (ID3D11UnorderedAccessView* uav = device_.buffer_uav(*b, offset, size)) {
+                const UINT values[4] = {value, value, value, value};
+                ctx_->ClearUnorderedAccessViewUint(uav, values);
+                copy_to_constant(*b, offset, size);
+                return;
+            }
         thread_local std::vector<uint8_t> data;
         data.assign(static_cast<size_t>(size), 0);
         if (value)
@@ -219,6 +235,136 @@ namespace conduit::d3d11 {
             ctx_->CSSetUnorderedAccessViews(0, (std::min)(bound_uavs_, 8u), null_uavs, nullptr);
         bound_srvs_ = {};
         bound_uavs_ = 0;
+        for (stage_bound& b : bound_) {
+            b.srvs = {};
+            b.srv_begin = cached_srvs;
+            b.srv_end = 0;
+        }
+    }
+
+    void cmd_list::reset_bound() {
+        bound_ = {};
+        state_bound_ = {};
+    }
+
+    void cmd_list::bind_constant(uint32_t stage, uint32_t slot, ID3D11Buffer* cb, bool offset_call, UINT first,
+                                 UINT constants) {
+        if (!offset_call) {
+            first = 0;
+            constants = ~0u;
+        }
+        if (slot < cached_constants) {
+            stage_bound& b = bound_[stage];
+            if (b.constants[slot] == cb && b.first[slot] == first && b.count[slot] == constants)
+                return;
+            b.constants[slot] = cb;
+            b.first[slot] = first;
+            b.count[slot] = constants;
+        }
+        switch (stage) {
+        case stage_vertex:
+            if (offset_call)
+                ctx1_->VSSetConstantBuffers1(slot, 1, &cb, &first, &constants);
+            else
+                ctx_->VSSetConstantBuffers(slot, 1, &cb);
+            break;
+        case stage_pixel:
+            if (offset_call)
+                ctx1_->PSSetConstantBuffers1(slot, 1, &cb, &first, &constants);
+            else
+                ctx_->PSSetConstantBuffers(slot, 1, &cb);
+            break;
+        default:
+            if (offset_call)
+                ctx1_->CSSetConstantBuffers1(slot, 1, &cb, &first, &constants);
+            else
+                ctx_->CSSetConstantBuffers(slot, 1, &cb);
+            break;
+        }
+    }
+
+    void cmd_list::bind_srv(uint32_t stage, uint32_t slot, ID3D11ShaderResourceView* srv) {
+        if (slot < cached_srvs) {
+            stage_bound& b = bound_[stage];
+            if (b.srvs[slot] == srv)
+                return;
+            b.srvs[slot] = srv;
+            if (stage != stage_compute) {
+                b.srv_begin = (std::min)(b.srv_begin, slot);
+                b.srv_end = (std::max)(b.srv_end, slot + 1);
+                return;
+            }
+        }
+        if (stage == stage_vertex)
+            ctx_->VSSetShaderResources(slot, 1, &srv);
+        else if (stage == stage_pixel)
+            ctx_->PSSetShaderResources(slot, 1, &srv);
+        else
+            ctx_->CSSetShaderResources(slot, 1, &srv);
+    }
+
+    void cmd_list::bind_sampler(uint32_t stage, uint32_t slot, ID3D11SamplerState* state) {
+        if (slot < cached_samplers) {
+            stage_bound& b = bound_[stage];
+            if (b.samplers[slot] == state)
+                return;
+            b.samplers[slot] = state;
+            if (stage != stage_compute) {
+                b.sampler_begin = (std::min)(b.sampler_begin, slot);
+                b.sampler_end = (std::max)(b.sampler_end, slot + 1);
+                return;
+            }
+        }
+        if (stage == stage_vertex)
+            ctx_->VSSetSamplers(slot, 1, &state);
+        else if (stage == stage_pixel)
+            ctx_->PSSetSamplers(slot, 1, &state);
+        else
+            ctx_->CSSetSamplers(slot, 1, &state);
+    }
+
+    // slots inside a range that did not change are sent with the value the context already holds, or null where
+    // the shadow was reset, which only clears a slot no set of the current pipeline uses
+    void cmd_list::flush_graphics_binds() {
+        stage_bound& v = bound_[stage_vertex];
+        stage_bound& f = bound_[stage_pixel];
+        if (v.srv_begin < v.srv_end)
+            ctx_->VSSetShaderResources(v.srv_begin, v.srv_end - v.srv_begin, v.srvs.data() + v.srv_begin);
+        if (f.srv_begin < f.srv_end)
+            ctx_->PSSetShaderResources(f.srv_begin, f.srv_end - f.srv_begin, f.srvs.data() + f.srv_begin);
+        if (v.sampler_begin < v.sampler_end)
+            ctx_->VSSetSamplers(v.sampler_begin, v.sampler_end - v.sampler_begin, v.samplers.data() + v.sampler_begin);
+        if (f.sampler_begin < f.sampler_end)
+            ctx_->PSSetSamplers(f.sampler_begin, f.sampler_end - f.sampler_begin, f.samplers.data() + f.sampler_begin);
+        for (stage_bound* b : {&v, &f}) {
+            b->srv_begin = cached_srvs;
+            b->srv_end = 0;
+            b->sampler_begin = cached_samplers;
+            b->sampler_end = 0;
+        }
+    }
+
+    void cmd_list::apply_pipeline(const pipeline& p) {
+        state_bound& b = state_bound_;
+        const bool all = b.fresh;
+        if (all || b.input_layout != p.input_layout.get())
+            ctx_->IASetInputLayout(b.input_layout = p.input_layout.get());
+        if (all || b.topology != p.topology)
+            ctx_->IASetPrimitiveTopology(b.topology = p.topology);
+        if (all || b.vs != p.vs.get())
+            ctx_->VSSetShader(b.vs = p.vs.get(), nullptr, 0);
+        if (all || b.ps != p.ps.get())
+            ctx_->PSSetShader(b.ps = p.ps.get(), nullptr, 0);
+        if (all || b.raster != p.raster.get())
+            ctx_->RSSetState(b.raster = p.raster.get());
+        if (all || b.blend != p.blend.get())
+            ctx_->OMSetBlendState(b.blend = p.blend.get(), nullptr, 0xFFFFFFFFu);
+        if (all || b.depth_stencil != p.depth_stencil.get() || b.stencil_ref != stencil_ref_) {
+            b.depth_stencil = p.depth_stencil.get();
+            b.stencil_ref = stencil_ref_;
+            ctx_->OMSetDepthStencilState(b.depth_stencil, stencil_ref_);
+        }
+        b.fresh = false;
     }
 
     void cmd_list::begin_rendering(const rendering_desc& desc) {
@@ -294,6 +440,8 @@ namespace conduit::d3d11 {
     }
 
     void cmd_list::set_pipeline(pipeline_handle p) {
+        if (p == pipeline_)
+            return;
         pipeline_ = p;
         pipeline_dirty_ = true;
         dirty_sets_ = 0xF;
@@ -304,12 +452,22 @@ namespace conduit::d3d11 {
         if (set >= max_bind_groups)
             return;
         bound_set& s = sets_[set];
+        const uint32_t bit = 1u << set;
+        const uint32_t count = static_cast<uint32_t>(std::min<size_t>(dynamic_offsets.size(), max_dynamic_offsets));
+        counters_.group_binds++;
+        if (s.group == group && !(dirty_sets_ & bit)) {
+            if (count == s.offset_count &&
+                std::equal(dynamic_offsets.begin(), dynamic_offsets.begin() + count, s.offsets.begin()))
+                return;
+            s.offset_count = count;
+            std::copy_n(dynamic_offsets.begin(), count, s.offsets.begin());
+            offsets_dirty_ |= bit;
+            return;
+        }
         s.group = group;
-        s.offset_count = static_cast<uint32_t>(std::min<size_t>(dynamic_offsets.size(), max_dynamic_offsets));
-        for (uint32_t i = 0; i < s.offset_count; i++)
-            s.offsets[i] = dynamic_offsets[i];
-        dirty_sets_ |= 1u << set;
-        device_.mutable_stats().bind_group_binds++;
+        s.offset_count = count;
+        std::copy_n(dynamic_offsets.begin(), count, s.offsets.begin());
+        dirty_sets_ |= bit;
     }
 
     void cmd_list::push_constants(const void*, uint32_t, uint32_t) {
@@ -369,18 +527,115 @@ namespace conduit::d3d11 {
 
     void cmd_list::set_stencil_reference(uint32_t value) {
         stencil_ref_ = value;
-        if (const pipeline* p = device_.pipelines_.get(pipeline_); p && !p->compute && in_pass_)
-            ctx_->OMSetDepthStencilState(p->depth_stencil.get(), stencil_ref_);
+        if (const pipeline* p = device_.pipelines_.get(pipeline_);
+            p && !p->compute && in_pass_ && !pipeline_dirty_ && state_bound_.stencil_ref != value) {
+            state_bound_.depth_stencil = p->depth_stencil.get();
+            state_bound_.stencil_ref = value;
+            ctx_->OMSetDepthStencilState(state_bound_.depth_stencil, value);
+        }
+    }
+
+    bool cmd_list::bind_uniform(uniform_range& u, const uniform_range* same, const bound_set& set) {
+        // a stage reading the bytes another stage of this set just had copied into a mirror binds that mirror
+        if (same && same->mirror) {
+            u.mirror = same->mirror;
+            bind_constant(u.stage, u.slot, u.mirror, false, 0, 0);
+            return true;
+        }
+        buffer* b = device_.buffers_.get(u.buffer);
+        if (!b) {
+            device_.report_error("bind group buffer at binding " + std::to_string(u.binding) + " is gone");
+            return false;
+        }
+        const uint64_t offset = u.base + (u.dynamic < set.offset_count ? set.offsets[u.dynamic] : 0);
+        const uint64_t size = u.size ? u.size : b->gpu_size - (std::min)(offset, b->gpu_size);
+        u.mirror = nullptr;
+        if (b->constant && ctx1_ && (offset & 255) == 0 && offset < b->gpu_size) {
+            const uint64_t span = std::min<uint64_t>(align_up(size, 256), b->gpu_size - offset);
+            bind_constant(u.stage, u.slot, b->constant.get(), true, static_cast<UINT>(offset / 16),
+                          static_cast<UINT>(std::min<uint64_t>(span, constant_window) / 16));
+            return true;
+        }
+        if (!b->shadow.empty() && b->desc.memory != memory_class::gpu_only &&
+            b->desc.memory != memory_class::readback) {
+            upload_mirror& um = upload_mirrors_[u.stage][u.slot];
+            const uint64_t avail = b->shadow.size() > offset ? b->shadow.size() - offset : 0;
+            const uint64_t want = (std::min)({size, avail, constant_window});
+            const UINT n = static_cast<UINT>(want & ~15ull);
+            if (!n) {
+                device_.report_error("uniform buffer range is empty at binding " + std::to_string(u.binding));
+                return false;
+            }
+            if (!um.buffer || um.bytes != n) {
+                D3D11_BUFFER_DESC md{};
+                md.ByteWidth = n;
+                md.Usage = D3D11_USAGE_DEFAULT;
+                md.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+                um.buffer = nullptr;
+                if (FAILED(device_.dev()->CreateBuffer(&md, nullptr, um.buffer.put())))
+                    return false;
+                um.bytes = n;
+                um.valid = false;
+            }
+            const uint8_t* src = b->shadow.data() + offset;
+            if (!um.valid || std::memcmp(um.last.data(), src, n) != 0) {
+                ctx_->UpdateSubresource(um.buffer.get(), 0, nullptr, src, 0, 0);
+                um.last.assign(src, src + n);
+                um.valid = true;
+            }
+            u.mirror = um.buffer.get();
+        } else {
+            winrt::com_ptr<ID3D11Buffer>& mirror = mirrors_[u.stage][u.slot];
+            if (!mirror) {
+                D3D11_BUFFER_DESC md{};
+                md.ByteWidth = static_cast<UINT>(constant_window);
+                md.Usage = D3D11_USAGE_DEFAULT;
+                md.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+                if (FAILED(device_.dev()->CreateBuffer(&md, nullptr, mirror.put())))
+                    return false;
+            }
+            const uint64_t n = std::min<uint64_t>(
+                {align_up(size, 16), constant_window, b->gpu_size - (std::min)(offset, b->gpu_size)});
+            const D3D11_BOX box{static_cast<UINT>(offset), 0, 0, static_cast<UINT>(offset + n), 1, 1};
+            ctx_->CopySubresourceRegion(mirror.get(), 0, 0, 0, 0, b->main.get(), 0, &box);
+            u.mirror = mirror.get();
+        }
+        bind_constant(u.stage, u.slot, u.mirror, false, 0, 0);
+        return true;
     }
 
     bool cmd_list::bind_sets(const pipeline& p) {
         const uint32_t first = p.compute ? stage_compute : stage_vertex;
         const uint32_t last = p.compute ? stage_compute : stage_pixel;
+        for (uint32_t moved = offsets_dirty_ & ~dirty_sets_; moved;) {
+            const uint32_t s = static_cast<uint32_t>(std::countr_zero(moved));
+            moved &= moved - 1;
+            const bound_set& bs = sets_[s];
+            resolved_set& r = resolved_[s];
+            if (!r.valid || r.pipeline != pipeline_ || r.group != bs.group) {
+                dirty_sets_ |= 1u << s;
+                continue;
+            }
+            for (uint32_t i = 0; i < r.count; i++) {
+                uniform_range& u = r.constants[i];
+                if (u.dynamic != no_dynamic && !bind_uniform(u, u.same < i ? &r.constants[u.same] : nullptr, bs)) {
+                    dirty_sets_ |= 1u << s;
+                    offsets_dirty_ = 0;
+                    return false;
+                }
+            }
+        }
+        offsets_dirty_ = 0;
         for (uint32_t s = 0; s < max_bind_groups; s++) {
             if (!(dirty_sets_ & (1u << s)))
                 continue;
             const bound_set& bs = sets_[s];
             const bind_group* group = device_.bind_groups_.get(bs.group);
+            resolved_set& r = resolved_[s];
+            r.pipeline = pipeline_;
+            r.group = bs.group;
+            r.valid = true;
+            r.count = 0;
             for (uint32_t stage = first; stage <= last; stage++) {
                 for (const stage_slot& slot : p.stages[stage]) {
                     if (slot.set != s)
@@ -401,90 +656,34 @@ namespace conduit::d3d11 {
                     }
                     switch (slot.kind) {
                     case resource_kind::uniform_buffer: {
-                        buffer* b = device_.buffers_.get(e->buffer.buffer);
-                        if (!b) {
-                            device_.report_error("bind group buffer at binding " + std::to_string(slot.binding) +
-                                                 " is gone");
-                            return false;
+                        uniform_range u;
+                        u.stage = static_cast<uint8_t>(stage);
+                        u.slot = static_cast<uint8_t>(slot.slot);
+                        u.dynamic = slot.dynamic_index < max_dynamic_offsets ? static_cast<uint8_t>(slot.dynamic_index)
+                                                                             : no_dynamic;
+                        u.binding = slot.binding;
+                        u.buffer = e->buffer.buffer;
+                        u.base = e->buffer.offset;
+                        u.size = e->buffer.size;
+                        const uniform_range* same = nullptr;
+                        for (uint32_t i = 0; i < r.count && !same; i++) {
+                            const uniform_range& o = r.constants[i];
+                            if (o.buffer == u.buffer && o.base == u.base && o.size == u.size &&
+                                o.dynamic == u.dynamic) {
+                                same = &o;
+                                u.same = static_cast<uint8_t>(i);
+                            }
                         }
-                        uint64_t offset = e->buffer.offset;
-                        if (slot.dynamic_index != ~0u && slot.dynamic_index < bs.offset_count)
-                            offset += bs.offsets[slot.dynamic_index];
-                        const uint64_t size =
-                            e->buffer.size ? e->buffer.size : b->gpu_size - (std::min)(offset, b->gpu_size);
-                        ID3D11Buffer* cb = nullptr;
-                        UINT first_constant = 0, constants = 0;
-                        if (b->constant && ctx1_ && (offset & 255) == 0) {
-                            cb = b->constant.get();
-                            const uint64_t span = std::min<uint64_t>(align_up(size, 256), b->gpu_size - offset);
-                            first_constant = static_cast<UINT>(offset / 16);
-                            constants = static_cast<UINT>(std::min<uint64_t>(span, constant_window) / 16);
-                        } else if (!b->shadow.empty() && b->desc.memory != memory_class::gpu_only &&
-                                   b->desc.memory != memory_class::readback) {
-                            upload_mirror& um = upload_mirrors_[stage][slot.slot];
-                            const uint64_t avail = b->shadow.size() > offset ? b->shadow.size() - offset : 0;
-                            const uint64_t want = (std::min)({size, avail, constant_window});
-                            const UINT n = static_cast<UINT>(want & ~15ull);
-                            if (!n) {
-                                device_.report_error("uniform buffer range is empty at binding " +
-                                                     std::to_string(slot.binding));
+                        if (r.count == r.constants.size()) {
+                            r.valid = false;
+                            if (!bind_uniform(u, same, bs))
                                 return false;
-                            }
-                            if (!um.buffer || um.bytes != n) {
-                                D3D11_BUFFER_DESC md{};
-                                md.ByteWidth = n;
-                                md.Usage = D3D11_USAGE_DEFAULT;
-                                md.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-                                um.buffer = nullptr;
-                                if (FAILED(device_.dev()->CreateBuffer(&md, nullptr, um.buffer.put())))
-                                    return false;
-                                um.bytes = n;
-                                um.valid = false;
-                            }
-                            const uint8_t* src = b->shadow.data() + offset;
-                            if (!um.valid || std::memcmp(um.last.data(), src, n) != 0) {
-                                ctx_->UpdateSubresource(um.buffer.get(), 0, nullptr, src, 0, 0);
-                                um.last.assign(src, src + n);
-                                um.valid = true;
-                            }
-                            cb = um.buffer.get();
-                        } else {
-                            winrt::com_ptr<ID3D11Buffer>& mirror = mirrors_[stage][slot.slot];
-                            if (!mirror) {
-                                D3D11_BUFFER_DESC md{};
-                                md.ByteWidth = static_cast<UINT>(constant_window);
-                                md.Usage = D3D11_USAGE_DEFAULT;
-                                md.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-                                if (FAILED(device_.dev()->CreateBuffer(&md, nullptr, mirror.put())))
-                                    return false;
-                            }
-                            const uint64_t n = std::min<uint64_t>(
-                                {align_up(size, 16), constant_window, b->gpu_size - (std::min)(offset, b->gpu_size)});
-                            const D3D11_BOX box{static_cast<UINT>(offset), 0, 0, static_cast<UINT>(offset + n), 1, 1};
-                            ctx_->CopySubresourceRegion(mirror.get(), 0, 0, 0, 0, b->main.get(), 0, &box);
-                            cb = mirror.get();
-                        }
-                        const bool offset_call = cb == b->constant.get() && ctx1_;
-                        switch (stage) {
-                        case stage_vertex:
-                            if (offset_call)
-                                ctx1_->VSSetConstantBuffers1(slot.slot, 1, &cb, &first_constant, &constants);
-                            else
-                                ctx_->VSSetConstantBuffers(slot.slot, 1, &cb);
-                            break;
-                        case stage_pixel:
-                            if (offset_call)
-                                ctx1_->PSSetConstantBuffers1(slot.slot, 1, &cb, &first_constant, &constants);
-                            else
-                                ctx_->PSSetConstantBuffers(slot.slot, 1, &cb);
-                            break;
-                        default:
-                            if (offset_call)
-                                ctx1_->CSSetConstantBuffers1(slot.slot, 1, &cb, &first_constant, &constants);
-                            else
-                                ctx_->CSSetConstantBuffers(slot.slot, 1, &cb);
                             break;
                         }
+                        r.constants[r.count] = u;
+                        if (!bind_uniform(r.constants[r.count], same, bs))
+                            return false;
+                        r.count++;
                         break;
                     }
                     case resource_kind::storage_buffer:
@@ -509,15 +708,22 @@ namespace conduit::d3d11 {
                             }
                             ctx_->CSSetUnorderedAccessViews(slot.slot, 1, &uav, nullptr);
                             bound_uavs_ = (std::max)(bound_uavs_, slot.slot + 1);
+                            // binding a resource for writing pulls it out of every stage's read slots
+                            for (stage_bound& sb : bound_)
+                                sb.srvs = {};
                             break;
                         }
                         ID3D11ShaderResourceView* srv = nullptr;
                         if (slot.kind == resource_kind::sampled_texture ||
                             slot.kind == resource_kind::storage_texture) {
-                            texture* t = device_.textures_.get(e->texture.texture);
-                            srv = t ? device_.srv_of(*t, e->texture.range, slot.dim, e->texture.format,
-                                                     e->texture.stencil)
-                                    : nullptr;
+                            if (texture* t = device_.textures_.get(e->texture.texture)) {
+                                const bind_group::texture_view* v =
+                                    group->views.empty() ? nullptr : &group->views[e - group->entries.data()];
+                                srv = v && v->srv && v->dim == slot.dim
+                                          ? v->srv.get()
+                                          : device_.srv_of(*t, e->texture.range, slot.dim, e->texture.format,
+                                                           e->texture.stencil);
+                            }
                         } else {
                             buffer* b = device_.buffers_.get(e->buffer.buffer);
                             srv = b ? device_.buffer_srv(*b, e->buffer.offset, e->buffer.size) : nullptr;
@@ -527,12 +733,7 @@ namespace conduit::d3d11 {
                                                  " is gone");
                             return false;
                         }
-                        if (stage == stage_vertex)
-                            ctx_->VSSetShaderResources(slot.slot, 1, &srv);
-                        else if (stage == stage_pixel)
-                            ctx_->PSSetShaderResources(slot.slot, 1, &srv);
-                        else
-                            ctx_->CSSetShaderResources(slot.slot, 1, &srv);
+                        bind_srv(stage, slot.slot, srv);
                         bound_srvs_[stage] = (std::max)(bound_srvs_[stage], slot.slot + 1);
                         break;
                     }
@@ -543,13 +744,7 @@ namespace conduit::d3d11 {
                                                  " is gone");
                             return false;
                         }
-                        ID3D11SamplerState* state = sm->state.get();
-                        if (stage == stage_vertex)
-                            ctx_->VSSetSamplers(slot.slot, 1, &state);
-                        else if (stage == stage_pixel)
-                            ctx_->PSSetSamplers(slot.slot, 1, &state);
-                        else
-                            ctx_->CSSetSamplers(slot.slot, 1, &state);
+                        bind_sampler(stage, slot.slot, sm->state.get());
                         break;
                     }
                     }
@@ -557,10 +752,64 @@ namespace conduit::d3d11 {
             }
         }
         dirty_sets_ = 0;
+        if (!p.compute)
+            flush_graphics_binds();
         return true;
     }
 
-    bool cmd_list::prepare_draw() {
+    bool cmd_list::bind_vertex_streams(const pipeline& p, int64_t max_shift) {
+        state_bound& sb = state_bound_;
+        const bool rebase = max_shift >= 0 && !p.vertex_id;
+        std::array<ID3D11Buffer*, max_vertex_streams> bufs{};
+        for (uint32_t i = 0; i < p.stream_count; i++) {
+            const uint32_t bit = 1u << i;
+            const bool needed = (vertex_dirty_ & bit) || (vertex_shift_ && (p.per_vertex & bit));
+            if (!needed && !(rebase && (p.per_vertex & bit)))
+                continue;
+            if (buffer* b = device_.buffers_.get(vertex_[i].buffer)) {
+                bufs[i] = b->main.get();
+            } else if (needed) {
+                device_.report_error("draw: vertex stream " + std::to_string(i) + " is not bound");
+                return false;
+            }
+        }
+        // the per-vertex streams can stay where they are when all of them moved by the same whole number of
+        // vertices from what the context holds
+        bool keep = rebase && p.per_vertex;
+        int64_t shift = -1;
+        for (uint32_t i = 0; keep && i < p.stream_count; i++) {
+            if (!(p.per_vertex & (1u << i)))
+                continue;
+            const UINT stride = p.strides[i];
+            const UINT offset = static_cast<UINT>(vertex_[i].offset);
+            if (!bufs[i] || bufs[i] != sb.vertex[i] || sb.stride[i] != stride || !stride || offset < sb.offset[i] ||
+                (offset - sb.offset[i]) % stride) {
+                keep = false;
+                break;
+            }
+            const int64_t d = (offset - sb.offset[i]) / stride;
+            keep = (shift < 0 || d == shift) && d <= max_shift;
+            shift = d;
+        }
+        vertex_shift_ = keep ? static_cast<uint32_t>(shift) : 0;
+        for (uint32_t i = 0; i < p.stream_count; i++) {
+            if (!bufs[i] || (keep && (p.per_vertex & (1u << i))))
+                continue;
+            const UINT stride = p.strides[i];
+            const UINT offset = static_cast<UINT>(vertex_[i].offset);
+            if (sb.vertex[i] == bufs[i] && sb.stride[i] == stride && sb.offset[i] == offset)
+                continue;
+            sb.vertex[i] = bufs[i];
+            sb.stride[i] = stride;
+            sb.offset[i] = offset;
+            ctx_->IASetVertexBuffers(i, 1, &bufs[i], &stride, &offset);
+        }
+        vertex_dirty_ = 0;
+        return true;
+    }
+
+    // max_shift is how far the draw's start vertex may move, negative where it cannot (indirect arguments)
+    bool cmd_list::prepare_draw(int64_t max_shift) {
         recorded_ = true;
         if (!in_pass_) {
             device_.report_error("draw outside a rendering pass");
@@ -572,46 +821,28 @@ namespace conduit::d3d11 {
             return false;
         }
         if (pipeline_dirty_) {
-            ctx_->IASetInputLayout(p->input_layout.get());
-            ctx_->IASetPrimitiveTopology(p->topology);
-            ctx_->VSSetShader(p->vs.get(), nullptr, 0);
-            ctx_->PSSetShader(p->ps.get(), nullptr, 0);
-            ctx_->RSSetState(p->raster.get());
-            ctx_->OMSetBlendState(p->blend.get(), nullptr, 0xFFFFFFFFu);
-            ctx_->OMSetDepthStencilState(p->depth_stencil.get(), stencil_ref_);
+            apply_pipeline(*p);
             pipeline_dirty_ = false;
-            device_.mutable_stats().pipeline_binds++;
+            counters_.pipeline_binds++;
         }
-        if (!bind_sets(*p))
+        if ((dirty_sets_ | offsets_dirty_) && !bind_sets(*p))
             return false;
-        for (uint32_t i = 0; i < p->stream_count; i++) {
-            if (!(vertex_dirty_ & (1u << i)))
-                continue;
-            buffer* b = device_.buffers_.get(vertex_[i].buffer);
-            if (!b) {
-                device_.report_error("draw: vertex stream " + std::to_string(i) + " is not bound");
-                return false;
-            }
-            ID3D11Buffer* buf = b->main.get();
-            const UINT stride = p->strides[i];
-            const UINT offset = static_cast<UINT>(vertex_[i].offset);
-            ctx_->IASetVertexBuffers(i, 1, &buf, &stride, &offset);
-        }
-        vertex_dirty_ = 0;
+        if (vertex_dirty_ || (vertex_shift_ && vertex_shift_ > max_shift))
+            return bind_vertex_streams(*p, max_shift);
         return true;
     }
 
     void cmd_list::draw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
                         uint32_t first_instance) {
-        if (!prepare_draw())
+        if (!prepare_draw(int64_t{UINT32_MAX} - first_vertex))
             return;
-        ctx_->DrawInstanced(vertex_count, instance_count, first_vertex, first_instance);
-        device_.mutable_stats().draws++;
+        ctx_->DrawInstanced(vertex_count, instance_count, first_vertex + vertex_shift_, first_instance);
+        counters_.draws++;
     }
 
     void cmd_list::draw_indexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index,
                                 int32_t vertex_offset, uint32_t first_instance) {
-        if (!prepare_draw())
+        if (!prepare_draw(int64_t{INT32_MAX} - vertex_offset))
             return;
         if (index_dirty_) {
             buffer* b = device_.buffers_.get(index_buffer_);
@@ -624,12 +855,13 @@ namespace conduit::d3d11 {
                                    static_cast<UINT>(index_offset_));
             index_dirty_ = false;
         }
-        ctx_->DrawIndexedInstanced(index_count, instance_count, first_index, vertex_offset, first_instance);
-        device_.mutable_stats().draws++;
+        ctx_->DrawIndexedInstanced(index_count, instance_count, first_index,
+                                   vertex_offset + static_cast<int32_t>(vertex_shift_), first_instance);
+        counters_.draws++;
     }
 
     void cmd_list::draw_indexed_indirect(buffer_handle args, uint64_t offset, uint32_t max_draws, uint32_t stride) {
-        if (!prepare_draw())
+        if (!prepare_draw(-1))
             return;
         buffer* a = device_.buffers_.get(args);
         buffer* ib = device_.buffers_.get(index_buffer_);
@@ -646,7 +878,7 @@ namespace conduit::d3d11 {
         for (uint32_t i = 0; i < max_draws; i++)
             ctx_->DrawIndexedInstancedIndirect(a->main.get(),
                                                static_cast<UINT>(offset + static_cast<uint64_t>(i) * stride));
-        device_.mutable_stats().indirect_draws += max_draws;
+        counters_.indirect += max_draws;
     }
 
     void cmd_list::draw_indexed_indirect_count(buffer_handle args, uint64_t offset, buffer_handle, uint64_t,
@@ -662,13 +894,14 @@ namespace conduit::d3d11 {
             return;
         }
         if (pipeline_dirty_) {
-            ctx_->CSSetShader(p->cs.get(), nullptr, 0);
+            if (state_bound_.fresh || state_bound_.cs != p->cs.get())
+                ctx_->CSSetShader(state_bound_.cs = p->cs.get(), nullptr, 0);
             pipeline_dirty_ = false;
         }
         if (!bind_sets(*p))
             return;
         ctx_->Dispatch(x, y, z);
-        device_.mutable_stats().dispatches++;
+        counters_.dispatches++;
         if (bound_uavs_) {
             static ID3D11UnorderedAccessView* const null_uavs[8] = {};
             ctx_->CSSetUnorderedAccessViews(0, (std::min)(bound_uavs_, 8u), null_uavs, nullptr);
@@ -686,13 +919,14 @@ namespace conduit::d3d11 {
             return;
         }
         if (pipeline_dirty_) {
-            ctx_->CSSetShader(p->cs.get(), nullptr, 0);
+            if (state_bound_.fresh || state_bound_.cs != p->cs.get())
+                ctx_->CSSetShader(state_bound_.cs = p->cs.get(), nullptr, 0);
             pipeline_dirty_ = false;
         }
         if (!bind_sets(*p))
             return;
         ctx_->DispatchIndirect(a->main.get(), static_cast<UINT>(offset));
-        device_.mutable_stats().dispatches++;
+        counters_.dispatches++;
         if (bound_uavs_) {
             static ID3D11UnorderedAccessView* const null_uavs[8] = {};
             ctx_->CSSetUnorderedAccessViews(0, (std::min)(bound_uavs_, 8u), null_uavs, nullptr);

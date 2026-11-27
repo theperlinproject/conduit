@@ -167,6 +167,12 @@ namespace conduit::d3d12 {
                     fl.pFeatureLevelsRequested = levels;
                     if (SUCCEEDED(probe->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &fl, sizeof(fl))))
                         a.api_version = fl.MaxSupportedFeatureLevel;
+                    // the memory architecture says integrated or not; dedicated memory alone does not, since apus
+                    // report a carve-out of 512MB or more as dedicated
+                    D3D12_FEATURE_DATA_ARCHITECTURE arch{};
+                    if (!software &&
+                        SUCCEEDED(probe->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &arch, sizeof(arch))))
+                        a.type = arch.UMA ? adapter_type::integrated : adapter_type::discrete;
                     D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_0};
                     if (FAILED(probe->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) ||
                         sm.HighestShaderModel < D3D_SHADER_MODEL_6_0) {
@@ -251,7 +257,7 @@ namespace conduit::d3d12 {
             return false;
         }
         device4_ = device_.try_as<ID3D12Device4>();
-        wait_event_ = winrt::handle{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
+        adapter3_ = adapter_.try_as<IDXGIAdapter3>();
 
         if (inst_->validation)
             info_queue_ = device_.try_as<ID3D12InfoQueue>();
@@ -293,9 +299,12 @@ namespace conduit::d3d12 {
             return false;
         }
 
+        // the per_frame ring sits on top of the 400000 persistent descriptors (tier 1 allows 1000000)
+        const uint32_t ring = ring_per_slot_ * options_.frames_in_flight;
         if (!rtv_pool_.init(device_.get(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2048) ||
             !dsv_pool_.init(device_.get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 512) ||
-            !resource_heap_.init(device_.get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 400000) ||
+            !resource_heap_.init(device_.get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 400000 + ring) ||
+            !resource_heap_.alloc(ring, ring_base_) ||
             !sampler_heap_.init(device_.get(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 2048)) {
             error = "descriptor heap creation failed";
             return false;
@@ -348,6 +357,7 @@ namespace conduit::d3d12 {
         D3D12_FEATURE_DATA_ARCHITECTURE1 arch{};
         if (SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, &arch, sizeof(arch))))
             uma_ = f.unified_memory = arch.UMA != FALSE;
+        gpu_upload_heap_ = !uma_ && allocator_->IsGPUUploadHeapSupported();
         D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_6};
         if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))))
             sm.HighestShaderModel = D3D_SHADER_MODEL_6_0;
@@ -466,11 +476,26 @@ namespace conduit::d3d12 {
             return;
         removal_reported_ = true;
 #if defined(__ID3D12DeviceRemovedExtendedData1_INTERFACE_DEFINED__)
-        static const char* const ops[] = {"SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced",
-                                          "ExecuteIndirect", "Dispatch", "CopyBufferRegion", "CopyTextureRegion",
-                                          "CopyResource", "CopyTiles", "ResolveSubresource", "ClearRenderTargetView",
-                                          "ClearUnorderedAccessView", "ClearDepthStencilView", "ResourceBarrier",
-                                          "ExecuteBundle", "Present", "ResolveQueryData", "BeginSubmission",
+        static const char* const ops[] = {"SetMarker",
+                                          "BeginEvent",
+                                          "EndEvent",
+                                          "DrawInstanced",
+                                          "DrawIndexedInstanced",
+                                          "ExecuteIndirect",
+                                          "Dispatch",
+                                          "CopyBufferRegion",
+                                          "CopyTextureRegion",
+                                          "CopyResource",
+                                          "CopyTiles",
+                                          "ResolveSubresource",
+                                          "ClearRenderTargetView",
+                                          "ClearUnorderedAccessView",
+                                          "ClearDepthStencilView",
+                                          "ResourceBarrier",
+                                          "ExecuteBundle",
+                                          "Present",
+                                          "ResolveQueryData",
+                                          "BeginSubmission",
                                           "EndSubmission"};
         winrt::com_ptr<ID3D12DeviceRemovedExtendedData1> data;
         if (FAILED(device_->QueryInterface(winrt::guid_of<ID3D12DeviceRemovedExtendedData1>(), data.put_void()))) {
@@ -490,7 +515,8 @@ namespace conduit::d3d12 {
                 const UINT from = done > 6 ? done - 6 : 0;
                 for (UINT i = from; i < std::min<UINT>(n->BreadcrumbCount, done + 4); i++) {
                     const UINT op = static_cast<UINT>(n->pCommandHistory[i]);
-                    line += std::string(i == done ? " >>" : " ") + (op < sizeof(ops) / sizeof(ops[0]) ? ops[op] : "op" + std::to_string(op));
+                    line += std::string(i == done ? " >>" : " ") +
+                            (op < sizeof(ops) / sizeof(ops[0]) ? ops[op] : "op" + std::to_string(op));
                 }
                 std::fprintf(stderr, "%s\n", line.c_str());
             }
@@ -521,7 +547,7 @@ namespace conduit::d3d12 {
 
     memory_budget device::query_memory_budget() {
         memory_budget out;
-        const auto a3 = adapter_.try_as<IDXGIAdapter3>();
+        IDXGIAdapter3* a3 = adapter3_.get();
         if (!a3)
             return out;
         DXGI_QUERY_VIDEO_MEMORY_INFO local{}, non_local{};

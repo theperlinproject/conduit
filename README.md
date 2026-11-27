@@ -38,6 +38,8 @@ Other options:
 | Option                       | Default | Effect                                              |
 |------------------------------|---------|-----------------------------------------------------|
 | `CONDUIT_LTO`                | off     | link-time optimization (on in the presets)          |
+| `CONDUIT_UNITY_BUILD`        | off     | compile each backend as one unit (a clean build of the library takes about 30% less) |
+| `CONDUIT_PGO`                | empty   | `generate` builds an instrumented library, `use` builds from `CONDUIT_PGO_DATA` (clang, gcc) |
 | `CONDUIT_CLANG_TIDY`         | off     | run `.clang-tidy` on every conduit source as it compiles |
 | `CONDUIT_WARNINGS_AS_ERRORS` | off     | `-Werror` / `/WX`                                   |
 | `CONDUIT_BUILD_TESTS`        | top level only | tests                                        |
@@ -70,7 +72,7 @@ has not been run on a GPU yet, so treat it as unverified.
 |--------------------------------|--------------------------------------------------------------|
 | `conduit/types.hpp`            | handles, formats, resource and pipeline descriptions         |
 | `conduit/device.hpp`           | `instance`, `device`, `command_list`, `swapchain`            |
-| `conduit/render_profile.hpp`   | system probing and `choose_profile` (API, adapter, tier, upscalers) |
+| `conduit/render_profile.hpp`   | system probing, `choose_profile` (API, adapter, tier, features, tuning) and `adaptive_tuner` |
 | `conduit/shader_library.hpp`   | reads shader packs built by `tools/pack_shaders.py`          |
 | `conduit/vendor.hpp`           | upscaling, frame generation and low-latency sessions         |
 | `conduit/conduit.hpp`          | all of the above                                             |
@@ -104,6 +106,39 @@ conduit_add_shader_pack(app_shaders
 
 The binding layout is as follows. Uniforms go in set 0, binding 0. Texture slot *n* goes in set 1, binding 2*n*, with its sampler at binding 2*n*+1.
 
+## Choosing a configuration
+
+`probe_system` lists every adapter on every compiled API with its capabilities, `query_system` describes the host (OS,
+cores and how many of them are fast, memory), and `choose_profile` turns both into a `render_profile`:
+
+```cpp
+conduit::user_choice user;
+user.workload = conduit::workload::draw_heavy;   // or balanced, gpu_heavy, texture_heavy, compute_heavy, low_latency, efficiency
+user.expected_draws = 20000;
+user.output_width = 3840, user.output_height = 2160;
+const conduit::render_profile profile =
+    conduit::choose_profile(conduit::probe_system({}), user, failures, conduit::query_system());
+auto device = conduit::create_instance(profile.api)->create_device(profile.device());
+std::puts(profile.explain().c_str());
+```
+
+The profile is deterministic for a given probe, host and `user_choice`. It carries the API and adapter, a tier, frames in
+flight, whether to cull and draw GPU-side, recording and pipeline thread counts, the smallest list worth a thread, an upload
+ring size, a memory budget, a render scale and the upscalers that apply. A feature is turned on when it pays for itself in
+the stated workload, not merely because the hardware has it: a few hundred draws are culled on the CPU, a GPU that shares
+its memory gets no second compute queue, a latency-sensitive title gets no generated frames and a shallower queue.
+
+Nothing is hidden. `profile.decisions` lists every feature considered as enabled, unused (available but left off) or
+unavailable, each with its reason; every candidate in `profile.fallbacks` carries the terms its score is the sum of; and
+`explain()` prints all of it. `user_choice::api`, `adapter_index`, `tier` and `bias` override the heuristics, and
+`known_failure` records keep a driver that crashed from being picked again.
+
+`adaptive_tuner` is optional and runs while the application does. Fed one CPU and GPU time per frame, it says which of
+the two is the bottleneck and nudges the render scale and the number of recording threads. A reading has to hold for
+`settle_frames` before anything changes and nothing changes again for `cooldown_frames`, so a scene on the edge does not
+flip settings back and forth. `hardware_key` names the API, GPU, driver and core count a tuned value was measured on, for
+applications that store one.
+
 ## Building and testing
 
 ```sh
@@ -113,10 +148,30 @@ ctest --preset linux-clang
 ```
 
 The shader and GPU tests are registered when `slangc` is found (on `PATH`, or in `CONDUIT_DEPS_DIR/slang/bin`). The GPU tests
-exit with code 77 (skipped) on machines without a driver.
+exit with code 77 (skipped) on machines without a driver. `render_selftest <pack> <api>` draws 256 tiles whose colours
+encode the bind group, texture, uniform offset and vertex range each draw used and checks every one after reading them
+back, on Vulkan, Direct3D 12, Metal and WebGPU.
+
+## Measuring
+
+`tests/conduit_bench <pack> [api ...] [--draws N] [--frames N] [--json file]` measures what conduit itself costs on each
+API: recording (four draw patterns), submission, CPU and GPU frame time, barriers, indirect draws, creation and
+destruction of bind groups, buffers, textures and pipelines, uploads, recording on 1 to 8 threads, start-up, and
+allocations per frame. Every row is a distribution (median, p95, p99, min, max, average), and `--json` writes the table
+for comparing builds and backends. Where the platform reports it, recording is also given in instructions per draw: unlike
+a timer that number does not move with machine load, so it is the one to compare two builds by.
 
 ## Performance
 
+- `texture_usage::transient` marks a render target whose contents never leave its pass (a multisampled colour target,
+  a depth buffer nothing reads later). On Apple GPUs it is given no memory at all: a 1440p 4x colour and depth pair
+  with its resolve target went from 198 MiB to 28 MiB on an M4.
+- A texture can be viewed in a second format only when `texture_desc::view_format` names it. Textures that can be
+  reinterpreted lose framebuffer compression on most GPUs, and every colour texture used to be created that way:
+  sixteen 2048x2048 passes that each read the previous one take 1.1 to 2.4 ms on an M4 without it and 4.4 to 5.4 ms
+  with it.
+- The Metal backend drains the autoreleased objects it creates, so a render thread without an autorelease pool no
+  longer grows by a couple of kilobytes every frame.
 - GPU-driven rendering by default where the hardware has it: `device_features::gpu_driven` is set when multi draw
   indirect and a GPU-side draw count are both available (Vulkan with `drawIndirectCount`, Direct3D 12, null), and
   `render_profile::gpu_culling` follows it. `draw_indexed_indirect_count` without driver support runs every slot

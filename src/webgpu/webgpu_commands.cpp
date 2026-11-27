@@ -2,6 +2,10 @@
 
 #include <cstdio>
 
+#if !defined(__EMSCRIPTEN__)
+#include <webgpu/wgpu.h>
+#endif
+
 namespace conduit::webgpu {
     namespace {
         WGPULoadOp to_load(load_op op) {
@@ -9,6 +13,14 @@ namespace conduit::webgpu {
         }
         WGPUStoreOp to_store(store_op op) {
             return op == store_op::store ? WGPUStoreOp_Store : WGPUStoreOp_Discard;
+        }
+
+        // at most four offsets: a plain loop, where std::equal becomes a memcmp call on every draw
+        bool same_offsets(const uint32_t* a, const uint32_t* b, uint32_t count) {
+            for (uint32_t i = 0; i < count; i++)
+                if (a[i] != b[i])
+                    return false;
+            return true;
         }
     }
 
@@ -31,6 +43,27 @@ namespace conduit::webgpu {
         viewport_dirty_ = scissor_dirty_ = false;
         stencil_dirty_ = false;
         pass_width_ = pass_height_ = 0;
+        counters_ = {};
+        forget_sent();
+    }
+
+    void webgpu_command_list::forget_sent() {
+        sent_sets_ = {};
+        sent_vertex_ = {};
+        vertex_shift_ = 0;
+        sent_index_buffer_ = {};
+        viewport_sent_ = scissor_sent_ = false;
+    }
+
+    void webgpu_command_list::invalidate_bound_state() {
+        dirty_sets_ = 0xF;
+        pipeline_dirty_ = true;
+        vertex_dirty_ = 0xFF;
+        index_dirty_ = true;
+        viewport_dirty_ = viewport_set_;
+        scissor_dirty_ = scissor_set_;
+        stencil_dirty_ = true;
+        forget_sent();
     }
 
     WGPUCommandBuffer webgpu_command_list::finish() {
@@ -55,13 +88,13 @@ namespace conduit::webgpu {
 
     void webgpu_command_list::barrier(std::span<const texture_barrier> textures,
                                       std::span<const buffer_barrier> buffers) {
-        device_.mutable_stats().barriers += textures.size() + buffers.size();
+        counters_.barriers += textures.size() + buffers.size();
     }
     void webgpu_command_list::uav_barrier(buffer_handle) {
-        device_.mutable_stats().barriers++;
+        counters_.barriers++;
     }
     void webgpu_command_list::uav_barrier(texture_handle) {
-        device_.mutable_stats().barriers++;
+        counters_.barriers++;
     }
 
     void webgpu_command_list::copy_buffer(buffer_handle dst, uint64_t dst_offset, buffer_handle src,
@@ -263,13 +296,9 @@ namespace conduit::webgpu {
         rd.colorAttachments = colors.data();
         rd.depthStencilAttachment = have_depth ? &depth : nullptr;
         render_ = owned<WGPURenderPassEncoder>(wgpuCommandEncoderBeginRenderPass(encoder_.get(), &rd));
-        dirty_sets_ = 0xF;
-        pipeline_dirty_ = true;
-        vertex_dirty_ = 0xFF;
-        index_dirty_ = true;
-        viewport_dirty_ = viewport_set_;
-        scissor_dirty_ = scissor_set_;
-        stencil_dirty_ = true;
+        invalidate_bound_state();
+        // a pass starts with a zero stencil reference
+        stencil_dirty_ = stencil_ref_ != 0;
     }
 
     void webgpu_command_list::end_rendering() {
@@ -277,6 +306,9 @@ namespace conduit::webgpu {
     }
 
     void webgpu_command_list::set_pipeline(pipeline_handle p) {
+        // the same pipeline again keeps every group it already has bound
+        if (p == pipeline_ && !pipeline_dirty_)
+            return;
         pipeline_ = p;
         pipeline_dirty_ = true;
         dirty_sets_ = 0xF;
@@ -287,12 +319,16 @@ namespace conduit::webgpu {
         if (set >= max_bind_groups)
             return;
         bound_set& s = sets_[set];
+        const uint32_t count = static_cast<uint32_t>(std::min<size_t>(dynamic_offsets.size(), max_dynamic_offsets));
+        if (s.group == group && s.offset_count == count &&
+            same_offsets(dynamic_offsets.data(), s.offsets.data(), count))
+            return;
         s.group = group;
-        s.offset_count = static_cast<uint32_t>(std::min<size_t>(dynamic_offsets.size(), max_dynamic_offsets));
-        for (uint32_t i = 0; i < s.offset_count; i++)
+        s.offset_count = count;
+        for (uint32_t i = 0; i < count; i++)
             s.offsets[i] = dynamic_offsets[i];
         dirty_sets_ |= 1u << set;
-        device_.mutable_stats().bind_group_binds++;
+        counters_.group_binds++;
     }
 
     void webgpu_command_list::push_constants(const void*, uint32_t, uint32_t) {
@@ -331,6 +367,46 @@ namespace conduit::webgpu {
         stencil_dirty_ = true;
     }
 
+    bool webgpu_command_list::set_native_group(uint32_t s, const native_set* ns) {
+        sent_set& sent = sent_sets_[s];
+        WGPUBindGroup group = nullptr;
+        bind_group_handle handle;
+        WGPUBindGroupLayout layout = nullptr;
+        std::array<uint32_t, max_dynamic_offsets> picked{};
+        uint32_t picked_count = 0;
+        if (!ns) {
+            group = device_.empty_group();
+        } else if (ns->entries.empty()) {
+            group = ns->blank.get();
+        } else {
+            handle = sets_[s].group;
+            layout = ns->layout.get();
+            // the same group under the same layout keeps the native group resolved when it was last sent
+            if (handle == sent.group && layout == sent.layout && device_.bind_groups_.get(handle))
+                group = sent.native;
+            else
+                group = device_.native_group_for(handle, *ns);
+            for (uint32_t i = 0; i < ns->dynamic_pick.size() && i < max_dynamic_offsets; i++) {
+                const uint32_t from = ns->dynamic_pick[i];
+                picked[picked_count++] = from < sets_[s].offset_count ? sets_[s].offsets[from] : 0;
+            }
+        }
+        if (!group) {
+            device_.report_error(std::string(render_ ? "draw" : "Dispatch") + ": set " + std::to_string(s) +
+                                 " is not bound");
+            return false;
+        }
+        if (group == sent.native && handle == sent.group && layout == sent.layout &&
+            picked_count == sent.offset_count && same_offsets(picked.data(), sent.offsets.data(), picked_count))
+            return true;
+        if (render_)
+            wgpuRenderPassEncoderSetBindGroup(render_.get(), s, group, picked_count, picked.data());
+        else
+            wgpuComputePassEncoderSetBindGroup(compute_.get(), s, group, picked_count, picked.data());
+        sent = {handle, layout, group, picked, picked_count};
+        return true;
+    }
+
     bool webgpu_command_list::prepare_draw() {
         if (!render_) {
             device_.report_error("draw outside a rendering pass");
@@ -344,37 +420,14 @@ namespace conduit::webgpu {
         if (pipeline_dirty_) {
             wgpuRenderPassEncoderSetPipeline(render_.get(), p->render.get());
             pipeline_dirty_ = false;
-            device_.mutable_stats().pipeline_binds++;
+            counters_.pipeline_binds++;
+            // a shifted stream 0 is only right for the pipeline that allowed it
+            vertex_shift_ = 0;
+            vertex_dirty_ |= 1;
         }
-        for (uint32_t s = 0; s < p->set_count; s++) {
-            if (!(dirty_sets_ & (1u << s)))
-                continue;
-            native_set* ns = p->sets[s].get();
-            WGPUBindGroup group = nullptr;
-            std::array<uint32_t, max_dynamic_offsets> picked{};
-            uint32_t picked_count = 0;
-            if (!ns) {
-                group = device_.empty_group();
-            } else if (ns->entries.empty()) {
-                if (!ns->blank) {
-                    WGPUBindGroupDescriptor gd{};
-                    gd.layout = ns->layout.get();
-                    ns->blank = owned<WGPUBindGroup>(wgpuDeviceCreateBindGroup(device_.dev(), &gd));
-                }
-                group = ns->blank.get();
-            } else {
-                group = device_.native_group_for(sets_[s].group, *ns);
-                for (uint32_t i = 0; i < ns->dynamic_pick.size() && i < max_dynamic_offsets; i++) {
-                    const uint32_t from = ns->dynamic_pick[i];
-                    picked[picked_count++] = from < sets_[s].offset_count ? sets_[s].offsets[from] : 0;
-                }
-            }
-            if (!group) {
-                device_.report_error("draw: set " + std::to_string(s) + " is not bound");
+        for (uint32_t s = 0; s < p->set_count; s++)
+            if ((dirty_sets_ & (1u << s)) && !set_native_group(s, p->sets[s].get()))
                 return false;
-            }
-            wgpuRenderPassEncoderSetBindGroup(render_.get(), s, group, picked_count, picked.data());
-        }
         dirty_sets_ = 0;
         for (uint32_t i = 0; i < p->stream_count; i++) {
             if (!(vertex_dirty_ & (1u << i)))
@@ -384,8 +437,23 @@ namespace conduit::webgpu {
                 device_.report_error("draw: vertex stream " + std::to_string(i) + " is not bound");
                 return false;
             }
+            if (i == 0)
+                vertex_shift_ = 0;
+            if (vertex_[i] == sent_vertex_[i])
+                continue;
+            // the usual per-draw step through one buffer: the bound range already covers it, so only
+            // first_vertex moves, and the draw sends one call instead of two
+            if (i == 0 && p->shift_stride && vertex_[0].buffer == sent_vertex_[0].buffer &&
+                vertex_[0].offset > sent_vertex_[0].offset) {
+                const uint64_t delta = vertex_[0].offset - sent_vertex_[0].offset;
+                if (delta % p->shift_stride == 0 && delta / p->shift_stride <= 0x7FFFFFFFull) {
+                    vertex_shift_ = static_cast<uint32_t>(delta / p->shift_stride);
+                    continue;
+                }
+            }
             wgpuRenderPassEncoderSetVertexBuffer(render_.get(), i, b->native.get(), vertex_[i].offset,
                                                  b->gpu_size - vertex_[i].offset);
+            sent_vertex_[i] = vertex_[i];
         }
         vertex_dirty_ = 0;
         if (viewport_dirty_ && viewport_set_) {
@@ -394,7 +462,13 @@ namespace conduit::webgpu {
                 v.width = (std::min)(v.width, static_cast<float>(pass_width_) - v.x);
                 v.height = (std::min)(v.height, static_cast<float>(pass_height_) - v.y);
             }
-            wgpuRenderPassEncoderSetViewport(render_.get(), v.x, v.y, v.width, v.height, v.min_depth, v.max_depth);
+            const viewport& o = sent_viewport_;
+            if (!viewport_sent_ || v.x != o.x || v.y != o.y || v.width != o.width || v.height != o.height ||
+                v.min_depth != o.min_depth || v.max_depth != o.max_depth) {
+                wgpuRenderPassEncoderSetViewport(render_.get(), v.x, v.y, v.width, v.height, v.min_depth, v.max_depth);
+                sent_viewport_ = v;
+                viewport_sent_ = true;
+            }
             viewport_dirty_ = false;
         }
         if (scissor_dirty_ && scissor_set_) {
@@ -407,8 +481,13 @@ namespace conduit::webgpu {
                 r.height = static_cast<uint32_t>(
                     std::max<int64_t>(0, std::min<int64_t>(r.height, static_cast<int64_t>(pass_height_) - r.y)));
             }
-            wgpuRenderPassEncoderSetScissorRect(render_.get(), static_cast<uint32_t>(r.x), static_cast<uint32_t>(r.y),
-                                                r.width, r.height);
+            const rect& o = sent_scissor_;
+            if (!scissor_sent_ || r.x != o.x || r.y != o.y || r.width != o.width || r.height != o.height) {
+                wgpuRenderPassEncoderSetScissorRect(render_.get(), static_cast<uint32_t>(r.x),
+                                                    static_cast<uint32_t>(r.y), r.width, r.height);
+                sent_scissor_ = r;
+                scissor_sent_ = true;
+            }
             scissor_dirty_ = false;
         }
         if (stencil_dirty_) {
@@ -418,12 +497,44 @@ namespace conduit::webgpu {
         return true;
     }
 
+    bool webgpu_command_list::unshift_vertices() {
+        if (!vertex_shift_)
+            return true;
+        buffer* b = device_.buffers_.get(vertex_[0].buffer);
+        if (!b) {
+            device_.report_error("draw: vertex stream 0 is not bound");
+            return false;
+        }
+        wgpuRenderPassEncoderSetVertexBuffer(render_.get(), 0, b->native.get(), vertex_[0].offset,
+                                             b->gpu_size - vertex_[0].offset);
+        sent_vertex_[0] = vertex_[0];
+        vertex_shift_ = 0;
+        return true;
+    }
+
+    void webgpu_command_list::bind_index_buffer(const buffer& b) {
+        if (index_buffer_ != sent_index_buffer_ || index_type_ != sent_index_type_ ||
+            index_offset_ != sent_index_offset_) {
+            wgpuRenderPassEncoderSetIndexBuffer(render_.get(), b.native.get(),
+                                                index_type_ == index_type::u16 ? WGPUIndexFormat_Uint16
+                                                                               : WGPUIndexFormat_Uint32,
+                                                index_offset_, b.gpu_size - index_offset_);
+            sent_index_buffer_ = index_buffer_;
+            sent_index_type_ = index_type_;
+            sent_index_offset_ = index_offset_;
+        }
+        index_dirty_ = false;
+    }
+
     void webgpu_command_list::draw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
                                    uint32_t first_instance) {
         if (!prepare_draw())
             return;
-        wgpuRenderPassEncoderDraw(render_.get(), vertex_count, instance_count, first_vertex, first_instance);
-        device_.mutable_stats().draws++;
+        if (static_cast<uint64_t>(first_vertex) + vertex_shift_ > 0xFFFFFFFFull && !unshift_vertices())
+            return;
+        wgpuRenderPassEncoderDraw(render_.get(), vertex_count, instance_count, first_vertex + vertex_shift_,
+                                  first_instance);
+        counters_.draws++;
     }
 
     void webgpu_command_list::draw_indexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index,
@@ -436,15 +547,14 @@ namespace conduit::webgpu {
                 device_.report_error("DrawIndexed: no index buffer");
                 return;
             }
-            wgpuRenderPassEncoderSetIndexBuffer(render_.get(), b->native.get(),
-                                                index_type_ == index_type::u16 ? WGPUIndexFormat_Uint16
-                                                                               : WGPUIndexFormat_Uint32,
-                                                index_offset_, b->gpu_size - index_offset_);
-            index_dirty_ = false;
+            bind_index_buffer(*b);
         }
-        wgpuRenderPassEncoderDrawIndexed(render_.get(), index_count, instance_count, first_index, vertex_offset,
+        if (static_cast<int64_t>(vertex_offset) + vertex_shift_ > 0x7FFFFFFF && !unshift_vertices())
+            return;
+        wgpuRenderPassEncoderDrawIndexed(render_.get(), index_count, instance_count, first_index,
+                                         static_cast<int32_t>(vertex_offset + static_cast<int64_t>(vertex_shift_)),
                                          first_instance);
-        device_.mutable_stats().draws++;
+        counters_.draws++;
     }
 
     void webgpu_command_list::draw_indexed_indirect(buffer_handle args, uint64_t offset, uint32_t max_draws,
@@ -457,60 +567,83 @@ namespace conduit::webgpu {
             device_.report_error("DrawIndexedIndirect: bad buffer");
             return;
         }
-        if (index_dirty_) {
-            wgpuRenderPassEncoderSetIndexBuffer(render_.get(), ib->native.get(),
-                                                index_type_ == index_type::u16 ? WGPUIndexFormat_Uint16
-                                                                               : WGPUIndexFormat_Uint32,
-                                                index_offset_, ib->gpu_size - index_offset_);
-            index_dirty_ = false;
+        if (index_dirty_)
+            bind_index_buffer(*ib);
+        // the arguments live on the gpu, so the buffer has to be where they expect it
+        if (!unshift_vertices())
+            return;
+#if !defined(__EMSCRIPTEN__)
+        if (max_draws > 1 && stride == sizeof(draw_indexed_indirect_command) &&
+            device_.caps().features.multi_draw_indirect) {
+            wgpuRenderPassEncoderMultiDrawIndexedIndirect(render_.get(), a->native.get(), offset, max_draws);
+            counters_.indirect += max_draws;
+            return;
         }
+#endif
         for (uint32_t i = 0; i < max_draws; i++)
             wgpuRenderPassEncoderDrawIndexedIndirect(render_.get(), a->native.get(),
                                                      offset + static_cast<uint64_t>(i) * stride);
-        device_.mutable_stats().indirect_draws += max_draws;
+        counters_.indirect += max_draws;
     }
 
-    void webgpu_command_list::draw_indexed_indirect_count(buffer_handle args, uint64_t offset, buffer_handle, uint64_t,
-                                                          uint32_t max_draws, uint32_t stride) {
+    void webgpu_command_list::draw_indexed_indirect_count(buffer_handle args, uint64_t offset, buffer_handle count,
+                                                          uint64_t count_offset, uint32_t max_draws, uint32_t stride) {
+#if !defined(__EMSCRIPTEN__)
+        buffer* c = device_.buffers_.get(count);
+        if (c && stride == sizeof(draw_indexed_indirect_command) && device_.caps().features.draw_indirect_count) {
+            buffer* a = device_.buffers_.get(args);
+            buffer* ib = device_.buffers_.get(index_buffer_);
+            if (!prepare_draw())
+                return;
+            if (!a || !ib) {
+                device_.report_error("DrawIndexedIndirectCount: bad buffer");
+                return;
+            }
+            if (index_dirty_)
+                bind_index_buffer(*ib);
+            if (!unshift_vertices())
+                return;
+            wgpuRenderPassEncoderMultiDrawIndexedIndirectCount(render_.get(), a->native.get(), offset, c->native.get(),
+                                                               count_offset, max_draws);
+            counters_.indirect += max_draws;
+            return;
+        }
+#else
+        (void)count;
+        (void)count_offset;
+#endif
         draw_indexed_indirect(args, offset, max_draws, stride);
     }
 
     void webgpu_command_list::dispatch(uint32_t x, uint32_t y, uint32_t z) {
+        if (!prepare_dispatch())
+            return;
+        wgpuComputePassEncoderDispatchWorkgroups(compute_.get(), x, y, z);
+        counters_.dispatches++;
+    }
+
+    bool webgpu_command_list::prepare_dispatch() {
         const pipeline* p = device_.pipelines_.get(pipeline_);
         if (!p || !p->compute || !p->comp) {
             device_.report_error("Dispatch without a compute pipeline");
-            return;
+            return false;
         }
         if (!compute_) {
             end_pass();
             compute_ = owned<WGPUComputePassEncoder>(wgpuCommandEncoderBeginComputePass(encoder_.get(), nullptr));
             dirty_sets_ = 0xF;
             pipeline_dirty_ = true;
+            forget_sent();
         }
         if (pipeline_dirty_) {
             wgpuComputePassEncoderSetPipeline(compute_.get(), p->comp.get());
             pipeline_dirty_ = false;
         }
-        for (uint32_t s = 0; s < p->set_count; s++) {
-            if (!(dirty_sets_ & (1u << s)))
-                continue;
-            native_set* ns = p->sets[s].get();
-            WGPUBindGroup group = ns ? device_.native_group_for(sets_[s].group, *ns) : device_.empty_group();
-            std::array<uint32_t, max_dynamic_offsets> picked{};
-            uint32_t picked_count = 0;
-            if (ns)
-                for (uint32_t i = 0; i < ns->dynamic_pick.size() && i < max_dynamic_offsets; i++)
-                    picked[picked_count++] =
-                        ns->dynamic_pick[i] < sets_[s].offset_count ? sets_[s].offsets[ns->dynamic_pick[i]] : 0;
-            if (!group) {
-                device_.report_error("Dispatch: set " + std::to_string(s) + " is not bound");
-                return;
-            }
-            wgpuComputePassEncoderSetBindGroup(compute_.get(), s, group, picked_count, picked.data());
-        }
+        for (uint32_t s = 0; s < p->set_count; s++)
+            if ((dirty_sets_ & (1u << s)) && !set_native_group(s, p->sets[s].get()))
+                return false;
         dirty_sets_ = 0;
-        wgpuComputePassEncoderDispatchWorkgroups(compute_.get(), x, y, z);
-        device_.mutable_stats().dispatches++;
+        return true;
     }
 
     void webgpu_command_list::dispatch_indirect(buffer_handle args, uint64_t offset) {
@@ -519,9 +652,11 @@ namespace conduit::webgpu {
             device_.report_error("DispatchIndirect: bad buffer");
             return;
         }
-        dispatch(0, 0, 0);
-        if (compute_)
-            wgpuComputePassEncoderDispatchWorkgroupsIndirect(compute_.get(), a->native.get(), offset);
+        // binds like dispatch does, without the empty direct dispatch it used to record first
+        if (!prepare_dispatch())
+            return;
+        wgpuComputePassEncoderDispatchWorkgroupsIndirect(compute_.get(), a->native.get(), offset);
+        counters_.dispatches++;
     }
 
     void webgpu_command_list::write_timestamp(query_set_handle, uint32_t) {}

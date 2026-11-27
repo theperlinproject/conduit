@@ -295,23 +295,6 @@ namespace conduit::gles {
             return {};
         }
 
-        // the slow part of building a pipeline runs here, on the caller's thread
-        for (stage_source& s : stages) {
-            std::string error;
-            if (!translate_stage(s.source->words, s.source->stage, s.source->entry, features_.glsl_version, *layout,
-                                 s.translated, error)) {
-                std::string message = "shader translation failed (";
-                message += label;
-                message += "): ";
-                message += error;
-                report_error(message);
-                return {};
-            }
-        }
-        if (std::getenv("CONDUIT_GLES_DUMP_SHADERS"))
-            for (const stage_source& s : stages)
-                std::fprintf(stderr, "[gles] %s:\n%s\n", label.c_str(), s.translated.glsl.c_str());
-
         pipeline p;
         p.compute = compute != nullptr;
         p.layout = layout_handle;
@@ -376,63 +359,89 @@ namespace conduit::gles {
                     report_error("CreateGraphicsPipeline (" + label + "): unsupported vertex format");
                     return {};
                 }
+                p.stream_mask |= 1u << a.stream;
             }
         }
 
-        bool linked = thread_.call([&] {
-            std::vector<GLuint> shaders;
-            const auto fail = [&](const std::string& message) {
+        const program_key key{graphics ? graphics->vertex : shader_handle{},
+                              graphics ? graphics->fragment : shader_handle{},
+                              compute ? compute->compute : shader_handle{}, layout_handle};
+        {
+            std::lock_guard lock(program_mutex_);
+            if (const auto found = programs_.find(key); found != programs_.end()) {
+                p.program = found->second.program;
+                p.samplers = found->second.samplers;
+                program_users_[p.program]++;
+            }
+        }
+        if (p.program)
+            return pipelines_.alloc(std::move(p));
+
+        // the slow part of building a pipeline runs here, on the caller's thread
+        for (stage_source& s : stages) {
+            std::string error;
+            if (!translate_stage(s.source->words, s.source->stage, s.source->entry, features_.glsl_version, *layout,
+                                 s.translated, error)) {
+                std::string message = "shader translation failed (";
+                message += label;
+                message += "): ";
+                message += error;
                 report_error(message);
-                for (GLuint s : shaders)
-                    gl_.glDeleteShader(s);
-                return false;
-            };
-            const auto compile = [&](GLenum type, const std::string& source) -> GLuint {
+                return {};
+            }
+        }
+        if (std::getenv("CONDUIT_GLES_DUMP_SHADERS"))
+            for (const stage_source& s : stages)
+                std::fprintf(stderr, "[gles] %s:\n%s\n", label.c_str(), s.translated.glsl.c_str());
+
+        bool linked = thread_.call([&] {
+            // no status is read before the link: every query waits for the compiler, and drivers that compile in the
+            // background (browsers among them) work on all the stages at once until then
+            std::vector<std::pair<GLuint, const char*>> shaders;
+            const auto compile = [&](GLenum type, const char* source) {
                 const GLuint s = gl_.glCreateShader(type);
-                const char* text = source.c_str();
-                gl_.glShaderSource(s, 1, &text, nullptr);
+                gl_.glShaderSource(s, 1, &source, nullptr);
                 gl_.glCompileShader(s);
-                GLint ok = 0;
-                gl_.glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-                if (!ok) {
+                shaders.emplace_back(s, source);
+            };
+            for (const stage_source& s : stages)
+                compile(s.type, s.translated.glsl.c_str());
+            if (graphics && !graphics->fragment)
+                compile(GL_FRAGMENT_SHADER, empty_fragment(features_.glsl_version));
+            const GLuint program = gl_.glCreateProgram();
+            for (const auto& [s, source] : shaders)
+                gl_.glAttachShader(program, s);
+            gl_.glLinkProgram(program);
+            GLint ok = 0;
+            gl_.glGetProgramiv(program, GL_LINK_STATUS, &ok);
+            if (!ok) {
+                bool compiled = true;
+                for (const auto& [s, source] : shaders) {
+                    GLint status = 0;
+                    gl_.glGetShaderiv(s, GL_COMPILE_STATUS, &status);
+                    if (status)
+                        continue;
+                    compiled = false;
                     GLint length = 0;
                     gl_.glGetShaderiv(s, GL_INFO_LOG_LENGTH, &length);
                     std::string log(static_cast<size_t>(std::max(length, 1)), '\0');
                     gl_.glGetShaderInfoLog(s, length, nullptr, log.data());
                     report_error("GLSL compile failed (" + label + "):\n" + log + "\n--- source ---\n" + source);
-                    gl_.glDeleteShader(s);
-                    return 0;
                 }
-                return s;
-            };
-            for (const stage_source& s : stages) {
-                const GLuint id = compile(s.type, s.translated.glsl);
-                if (!id)
-                    return fail("CreatePipeline (" + label + "): a shader did not compile");
-                shaders.push_back(id);
+                if (compiled) {
+                    GLint length = 0;
+                    gl_.glGetProgramiv(program, GL_INFO_LOG_LENGTH, &length);
+                    std::string log(static_cast<size_t>(std::max(length, 1)), '\0');
+                    gl_.glGetProgramInfoLog(program, length, nullptr, log.data());
+                    report_error("GLSL link failed (" + label + "): " + log);
+                } else {
+                    report_error("CreatePipeline (" + label + "): a shader did not compile");
+                }
             }
-            if (graphics && !graphics->fragment) {
-                const GLuint id = compile(GL_FRAGMENT_SHADER, empty_fragment(features_.glsl_version));
-                if (!id)
-                    return fail("CreatePipeline (" + label + "): the empty fragment shader did not compile");
-                shaders.push_back(id);
-            }
-            const GLuint program = gl_.glCreateProgram();
-            for (GLuint s : shaders)
-                gl_.glAttachShader(program, s);
-            gl_.glLinkProgram(program);
-            for (GLuint s : shaders)
+            for (const auto& [s, source] : shaders)
                 gl_.glDeleteShader(s);
-            GLint ok = 0;
-            gl_.glGetProgramiv(program, GL_LINK_STATUS, &ok);
             if (!ok) {
-                GLint length = 0;
-                gl_.glGetProgramiv(program, GL_INFO_LOG_LENGTH, &length);
-                std::string log(static_cast<size_t>(std::max(length, 1)), '\0');
-                gl_.glGetProgramInfoLog(program, length, nullptr, log.data());
                 gl_.glDeleteProgram(program);
-                shaders.clear();
-                report_error("GLSL link failed (" + label + "): " + log);
                 return false;
             }
             p.program = program;
@@ -475,6 +484,11 @@ namespace conduit::gles {
             report_error("CreatePipeline (" + label + "): " + std::to_string(p.samplers.size()) +
                          " texture and sampler pairs are more than this OpenGL ES context has units for");
             return {};
+        }
+        {
+            std::lock_guard lock(program_mutex_);
+            program_users_[p.program] = 1;
+            programs_.try_emplace(key, shared_program{p.program, p.samplers});
         }
         return pipelines_.alloc(std::move(p));
     }

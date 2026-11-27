@@ -1,5 +1,6 @@
 #pragma once
 #include <conduit/device.hpp>
+#include "common/binding_lookup.hpp"
 #include "common/counters.hpp"
 #include "common/handle_pool.hpp"
 #include "common/retire_queue.hpp"
@@ -31,6 +32,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -137,12 +139,14 @@ namespace conduit::d3d12 {
     };
 
     struct shader_rec {
-        std::vector<uint8_t> code;
+        // shared with queued pipeline builds, which may outlive the shader
+        std::shared_ptr<const std::vector<uint8_t>> code;
         shader_stage stage = shader_stage::vertex;
     };
 
     struct bind_layout_rec {
         std::vector<bind_layout_entry> entries;
+        binding_lookup lookup;
         std::vector<uint32_t> table_offset;
         uint32_t table_count = 0;
         uint32_t sampler_count = 0;
@@ -164,20 +168,27 @@ namespace conduit::d3d12 {
         int sampler_table = -1;
         uint32_t sampler_offset = 0;
         bool per_frame = false;
+        bool ring = false; // descriptors from the frame slot's ring, released with the slot instead of freed
         uint32_t dynamic_count = 0;
         std::array<D3D12_GPU_VIRTUAL_ADDRESS, max_dynamic_offsets> dynamic_base{};
         std::vector<state_validator::bound_resource> bound;
     };
 
+    // the root parameter each set lands in (-1: none); every pipeline keeps a copy so binding never looks the
+    // layout up and a layout destroyed while a list is recording cannot leave it reading a reused slot
+    struct root_params {
+        int push = -1;
+        uint32_t push_bytes = 0;
+        uint32_t set_mask = 0;
+        std::array<int, max_bind_groups> table{};
+        std::array<int, max_bind_groups> samplers{};
+        std::array<std::array<int, max_dynamic_offsets>, max_bind_groups> dynamic{};
+    };
+
     struct pipeline_layout_rec {
         winrt::com_ptr<ID3D12RootSignature> root_signature;
         uint64_t hash = 0;
-        int push_param = -1;
-        uint32_t push_bytes = 0;
-        std::array<bind_layout_handle, max_bind_groups> sets{};
-        std::array<int, max_bind_groups> table_param{};
-        std::array<int, max_bind_groups> sampler_param{};
-        std::array<std::array<int, max_dynamic_offsets>, max_bind_groups> dynamic_param{};
+        root_params params;
     };
 
     // a graphics pso built on the device's compile threads: the first bind waits a few ms, after that draws with
@@ -204,7 +215,7 @@ namespace conduit::d3d12 {
         uint32_t color_count = 0;
         std::array<format, max_color_targets> color_formats{};
         format depth_format = format::unknown;
-        uint32_t push_bytes = 0;
+        root_params params;
         // work graphs: no pso, a state object with its program and backing memory instead
         winrt::com_ptr<ID3D12StateObject> graph;
         D3D12_PROGRAM_IDENTIFIER program{};
@@ -300,9 +311,25 @@ namespace conduit::d3d12 {
         queue_type queue_;
         winrt::com_ptr<ID3D12CommandAllocator> allocator_;
         winrt::com_ptr<ID3D12GraphicsCommandList> list_;
+        // queried on the first dispatch_graph: the native list lives as long as this object
+        winrt::com_ptr<ID3D12GraphicsCommandList10> list10_;
+        bool list10_checked_ = false;
 
-        pipeline_rec pipeline_;
-        pipeline_layout_handle layout_handle_;
+        // what the bound pipeline needs while recording, as raw pointers: a destroyed pipeline is released only
+        // after the frame's work completes, so they outlive the list, and binding takes no references
+        struct bound_pipeline {
+            ID3D12PipelineState* pso = nullptr;
+            ID3D12RootSignature* root = nullptr;
+            ID3D12StateObject* graph = nullptr;
+            bool compute = false;
+            D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+            std::array<uint32_t, max_vertex_streams> strides{};
+            root_params params;
+            D3D12_PROGRAM_IDENTIFIER program{};
+            D3D12_GPU_VIRTUAL_ADDRESS_RANGE backing_range{};
+            std::atomic<bool>* backing_ready = nullptr;
+        };
+        bound_pipeline pipeline_;
         bool have_pipeline_ = false;
         pipeline_handle pipeline_handle_{}; // the handle pipeline_ came from, for the same-pipeline early out
         bool pipeline_pending_ = false;
@@ -311,7 +338,28 @@ namespace conduit::d3d12 {
         std::array<bind_group_handle, max_bind_groups> groups_{};
         std::array<std::array<uint32_t, max_dynamic_offsets>, max_bind_groups> dynamic_offsets_{};
         std::array<uint32_t, max_bind_groups> dynamic_counts_{};
+        // dirty_sets_: root arguments to send again; table_dirty_: of those, the ones whose descriptor tables
+        // changed too (a new group or root signature). a draw that only moves a dynamic offset sends just its CBV
         uint32_t dirty_sets_ = 0;
+        uint32_t table_dirty_ = 0;
+        // what a bound group puts in the root signature, taken when it is bound so a draw never looks it up
+        struct bound_tables {
+            D3D12_GPU_DESCRIPTOR_HANDLE table{};
+            D3D12_GPU_DESCRIPTOR_HANDLE samplers{};
+            std::array<D3D12_GPU_VIRTUAL_ADDRESS, max_dynamic_offsets> dynamic_base{};
+            uint32_t dynamic_count = 0;
+        };
+        std::array<bound_tables, max_bind_groups> bound_tables_{};
+        // the tables last sent per set under the current root signature
+        struct sent_tables {
+            D3D12_GPU_DESCRIPTOR_HANDLE table{};
+            D3D12_GPU_DESCRIPTOR_HANDLE samplers{};
+        };
+        std::array<sent_tables, max_bind_groups> sent_tables_{};
+        ID3D12CommandSignature* signature(bool dispatch, uint32_t stride);
+        ID3D12CommandSignature* last_signature_ = nullptr;
+        uint32_t last_signature_key_ = ~0u;
+        bool have_stencil_ref_ = false;
         std::array<uint32_t, max_push_constant_bytes / 4> push_{};
         uint32_t push_used_ = 0;
         bool push_dirty_ = false;
@@ -320,6 +368,7 @@ namespace conduit::d3d12 {
         uint32_t vertex_dirty_ = 0;
         bool have_index_ = false;
         D3D12_INDEX_BUFFER_VIEW index_view_{};
+        D3D12_PRIMITIVE_TOPOLOGY topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
         std::array<format, max_color_targets> color_formats_{};
         uint32_t color_count_ = 0;
         format depth_format_ = format::unknown;
@@ -415,7 +464,7 @@ namespace conduit::d3d12 {
         memory_budget query_memory_budget() override;
         bool lost() const override { return device_ && device_->GetDeviceRemovedReason() != S_OK; }
         device_stats stats() const override;
-        winrt::com_ptr<ID3D12PipelineState> ready_pipeline(const pipeline_rec& p);
+        ID3D12PipelineState* ready_pipeline(const pipeline_rec& p);
         std::vector<uint8_t> serialize_pipeline_cache() override;
         std::string debug_report() override;
         float timestamp_period_ns() const override { return caps_.limits.timestamp_period_ns; }
@@ -441,6 +490,7 @@ namespace conduit::d3d12 {
         winrt::com_ptr<ID3D12Device> device_;
         winrt::com_ptr<ID3D12Device4> device4_;
         winrt::com_ptr<IDXGIAdapter1> adapter_;
+        winrt::com_ptr<IDXGIAdapter3> adapter3_;
         winrt::com_ptr<D3D12MA::Allocator> allocator_;
         std::shared_ptr<instance_state> inst_;
         device_caps caps_;
@@ -448,6 +498,7 @@ namespace conduit::d3d12 {
         state_validator validator_;
         bool use_validator_ = false;
         bool uma_ = false;
+        bool gpu_upload_heap_ = false;
 
         handle_pool<buffer_tag, buffer_rec> buffers_;
         handle_pool<texture_tag, texture_rec> textures_;
@@ -475,7 +526,8 @@ namespace conduit::d3d12 {
         void reset_slot(uint32_t s);
         void fill_caps();
         void write_sampler_desc(D3D12_CPU_DESCRIPTOR_HANDLE dst, const sampler_desc& d);
-        int acquire_sampler_table(const std::vector<uint32_t>& key, const std::vector<sampler_desc>& descs);
+        int acquire_sampler_table(std::span<const uint32_t> key, std::span<const sampler_desc> descs, uint32_t& offset);
+        bool ring_alloc(uint32_t slot, uint32_t count, uint32_t& offset);
         void release_sampler_table(int index);
 
         std::mutex sampler_mutex_;
@@ -486,7 +538,12 @@ namespace conduit::d3d12 {
         std::unordered_map<uint64_t, winrt::com_ptr<ID3D12CommandSignature>> signatures_;
 
         winrt::com_ptr<ID3D12PipelineLibrary> pipeline_library_;
+        // the library synchronises itself except for loads of one name from several threads: those take the
+        // stripe of their name, so compile threads load different pipelines at once. stores and
+        // serialization stay under library_mutex_ so a serialized size cannot change before the copy
         std::mutex library_mutex_;
+        std::array<std::mutex, 8> library_load_mutex_;
+        std::mutex& load_mutex(uint64_t key) { return library_load_mutex_[key % library_load_mutex_.size()]; }
 
         struct pipeline_job;
         void run_pipeline_job(pipeline_job& job);
@@ -504,12 +561,19 @@ namespace conduit::d3d12 {
 
         std::mutex pools_mutex_;
         std::unordered_map<std::thread::id, std::unique_ptr<thread_pools>> thread_pools_;
+        static inline std::atomic<uint64_t> next_id_{1};
+        const uint64_t id_ = next_id_.fetch_add(1, std::memory_order_relaxed);
 
         struct frame_groups {
             std::vector<bind_group_handle> groups;
         };
         std::vector<frame_groups> frame_groups_;
         std::mutex frame_group_mutex_;
+        // per_frame groups take their descriptors from a fixed region of resource_heap_ per frame slot, bumped
+        // without a lock and reset when the slot comes round again (its frame has completed by then)
+        static constexpr uint32_t ring_per_slot_ = 16384;
+        uint32_t ring_base_ = 0;
+        std::array<std::atomic<uint32_t>, 4> ring_used_{};
 
         retire_queue retire_;
         bool in_frame_ = false;
@@ -517,8 +581,6 @@ namespace conduit::d3d12 {
         uint32_t slot_ = 0;
         std::vector<queue_serials> slot_serials_;
         winrt::com_ptr<ID3D12InfoQueue> info_queue_;
-        winrt::handle wait_event_;
-        std::mutex wait_mutex_;
     };
 
     std::unique_ptr<conduit::swapchain> make_swapchain(device& device, const swapchain_desc& desc);

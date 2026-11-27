@@ -90,6 +90,11 @@ class Packer:
 
     def reflect(self, program, stage):
         stage_id, entry = STAGES[stage]
+        # cached like the compiled code, so repacking unchanged shaders runs slangc not at all
+        key = fingerprint(program, [Path(d) for d in self.dirs], f'{self.version}|{stage}|reflection')
+        cached = self.cache / key if self.cache else None
+        if cached and cached.exists():
+            return json.loads(cached.read_text())
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / 'out.spv'
             refl = Path(tmp) / 'refl.json'
@@ -101,7 +106,11 @@ class Packer:
             result = subprocess.run(command, capture_output=True, text=True, env=self.env)
             if result.returncode != 0:
                 raise RuntimeError(f'reflection {program.name}:\n{result.stdout}{result.stderr}')
-            return json.loads(refl.read_text())
+            text = refl.read_text()
+        if cached:
+            self.cache.mkdir(parents=True, exist_ok=True)
+            cached.write_text(text)
+        return json.loads(text)
 
 
 def uniform_layout(reflection):
