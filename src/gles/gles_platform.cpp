@@ -505,8 +505,19 @@ namespace conduit::gles {
         void egl_surface::set_interval(int interval) {
             if (interval == interval_)
                 return;
-            interval_ = interval;
-            libs().api.eglSwapInterval(context_.display(), interval);
+            // Probe against the actual window surface, not just the startup
+            // pbuffer: Android EGL implementations can enforce different
+            // swap-interval ranges for those two surface types.
+            if (libs().api.eglSwapInterval(context_.display(), interval) == EGL_TRUE) {
+                interval_ = interval;
+            } else if (interval == 0) {
+                // Some compositors mandate a synchronized swap. Keep their
+                // supported mode and avoid claiming uncapped presentation.
+                libs().api.eglSwapInterval(context_.display(), 1);
+                interval_ = 1;
+            } else {
+                interval_ = -1;
+            }
         }
 
         void egl_surface::extent(uint32_t& width, uint32_t& height) {

@@ -336,6 +336,9 @@ namespace conduit::gles {
         for (range_binding& r : cache_.uniform_ranges)
             if (r.buffer == gl)
                 r = range_binding{};
+        for (range_binding& r : cache_.storage_ranges)
+            if (r.buffer == gl)
+                r = range_binding{};
     }
 
     void device::resync() {
@@ -418,7 +421,11 @@ namespace conduit::gles {
             return;
         if (!surface.bind())
             return;
-        surface.set_interval(mode == present_mode::immediate && features_.vsync_off ? 0 : 1);
+        // FIFO is explicitly synchronized. For a requested immediate or
+        // mailbox fallback, attempt an unsynchronized EGL swap on the window
+        // surface even if the initial pbuffer capability probe failed.
+        // egl_surface::set_interval falls back to 1 when the driver rejects 0.
+        surface.set_interval(mode == present_mode::fifo ? 1 : 0);
         uint32_t dw = 0, dh = 0;
         surface.extent(dw, dh);
 
@@ -1421,8 +1428,17 @@ namespace conduit::gles {
                         const uint64_t offset = std::min(e->buffer.offset, buf->size);
                         const uint64_t size =
                             e->buffer.size ? std::min(e->buffer.size, buf->size - offset) : buf->size - offset;
-                        gl_.glBindBufferRange(GL_SHADER_STORAGE_BUFFER, slot.index, buf->gl,
-                                              static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(size));
+                        // Avoid redundant GLES calls on consecutive draws using the same SSBO range.
+                        // A context resync or buffer deletion invalidates this state cache.
+                        const GLintptr at = static_cast<GLintptr>(offset);
+                        const GLsizeiptr bytes = static_cast<GLsizeiptr>(size);
+                        if (slot.index < cache_.storage_ranges.size()) {
+                            range_binding& bound = cache_.storage_ranges[slot.index];
+                            if (bound.buffer == buf->gl && bound.offset == at && bound.size == bytes)
+                                break;
+                            bound = {buf->gl, at, bytes};
+                        }
+                        gl_.glBindBufferRange(GL_SHADER_STORAGE_BUFFER, slot.index, buf->gl, at, bytes);
                         break;
                     }
                     case binding_type::storage_texture_rw: {

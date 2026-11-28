@@ -444,6 +444,8 @@ namespace conduit::gles {
         GLfloat depth_near = -1.0f, depth_far = -1.0f;
         int unpack_row = -1, pack_row = -1;
         std::array<range_binding, 32> uniform_ranges{};
+        // SSBO bindings persist across draws just like UBO bindings.
+        std::array<range_binding, 32> storage_ranges{};
         std::array<GLint, 4> viewport_rect{}, scissor_rect{};
         bool viewport_valid = false, scissor_valid = false;
         gl_cache() { reset(); }
@@ -462,6 +464,7 @@ namespace conduit::gles {
             depth_near = depth_far = -1.0f;
             unpack_row = pack_row = -1;
             uniform_ranges.fill(range_binding{});
+            storage_ranges.fill(range_binding{});
             viewport_valid = scissor_valid = false;
         }
     };
